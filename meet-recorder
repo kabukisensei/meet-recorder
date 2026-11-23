@@ -29,6 +29,10 @@ DEFAULTS = {
     "whisper": {"model": "small", "device": "cpu",
                 "compute_type": "int8", "beam_size": "5"},
     "paths": {"output_dir": "~/Recordings"},
+    # Optional post-transcription summarizer: command run detached after
+    # a successful transcription; {folder} is replaced with the session
+    # folder. Example: "summary_cmd": "meet-recorder-summarize {folder}"
+    "summary": {"summary_cmd": ""},
     # Auto-record: the `watch` daemon starts a recording when one of these
     # apps opens the microphone (i.e. a call is live) and stops when it closes.
     "auto": {"enabled": "true", "apps": "teams", "poll_seconds": "2",
@@ -480,6 +484,14 @@ def finalize_audio(state, cfg):
     return folder
 
 
+def spawn_summary(cmd, folder):
+    """Run the optional post-transcription summarizer detached; never block
+    or fail the recording pipeline if it errors."""
+    log = open(os.path.join(folder, "summary.log"), "w")
+    subprocess.Popen(cmd, shell=True, stdin=subprocess.DEVNULL,
+                     stdout=log, stderr=log, start_new_session=True)
+
+
 def spawn_transcribe(folder):
     """Transcribe in a detached process so nothing that launched us can kill it."""
     log = open(os.path.join(folder, "transcribe.log"), "w")
@@ -554,6 +566,9 @@ def cmd_transcribe(args=()):
         write_transcripts(folder, segments, start, duration,
                           meta.get("title", ""))
         status = "done" if segments else "no-speech"
+        summary_cmd = cfg.get("summary", "summary_cmd", fallback="").strip()
+        if status == "done" and summary_cmd:
+            spawn_summary(summary_cmd.format(folder=folder), folder)
         meta.update({"duration_seconds": round(duration),
                      "whisper_model": cfg.get("whisper", "model")})
         notify("Transcript ready" if segments else "Recording saved (no speech found)",

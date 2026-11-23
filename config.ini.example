@@ -18,3 +18,8 @@ apps = teams
 poll_seconds = 2
 start_after_seconds = 4
 stop_after_seconds = 20
+
+[summary]
+# Command run (detached) after a successful transcription.
+# {folder} is replaced with the session folder. Leave empty to disable.
+summary_cmd =
