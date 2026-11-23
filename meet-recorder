@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""meet-recorder — local Pocket-style meeting recorder.
+
+Records system (meeting) audio and mic via PipeWire (pw-record), mixes them
+with ffmpeg, and transcribes locally with faster-whisper. Fully local: no
+network calls, ever. faster-whisper is imported lazily, only at transcribe time.
+"""
+
+import configparser
+import json
+import os
+import signal
+import shutil
+import subprocess
+import sys
+import time
+
+STATE_DIR = os.path.expanduser("~/.local/state/meet-recorder")
+STATE_FILE = os.path.join(STATE_DIR, "session.json")
+CACHE_DIR = os.path.expanduser("~/.cache/meet-recorder")
+CONFIG_FILE = os.path.expanduser("~/.config/meet-recorder/config.ini")
+
+DEFAULTS = {
+    "audio": {"sys_volume": "1.0", "mic_volume": "2.0", "sample_rate": "16000"},
+    "whisper": {"model": "base", "device": "cpu",
+                "compute_type": "int8", "beam_size": "5"},
+    "paths": {"output_dir": "~/Recordings"},
+}
+
+
+# --------------------------------------------------------------------------- #
+# Pure functions (unit-tested in tests/test_pure.py)
+# --------------------------------------------------------------------------- #
+
+def fmt_ts(seconds):
+    """Format a number of seconds as 'mm:ss' (minutes may exceed 59)."""
+    total = int(seconds)
+    m, s = divmod(total, 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def format_segment(start, end, text):
+    """Format one utterance as '[mm:ss -> mm:ss] text'."""
+    return f"[{fmt_ts(start)} -> {fmt_ts(end)}] {text.strip()}"
+
+
+def session_dir_name(start_unix, slug="meeting"):
+    """Return 'HHMMSS-<slug>' for a session starting at start_unix (local time)."""
+    return time.strftime("%H%M%S", time.localtime(start_unix)) + "-" + slug
+
+
+def load_config(path=CONFIG_FILE):
+    """Load config, merging any existing file over the built-in defaults.
+
+    Missing file -> defaults; partial file -> merged with defaults.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read_dict(DEFAULTS)
+    cfg.read(os.path.expanduser(path))
+    return cfg
+
+
+def build_ffmpeg_mix_cmd(sys_wav, mic_wav, out_path,
+                         sys_volume, mic_volume, sample_rate):
+    """Construct the exact ffmpeg argv list to mix the two raw WAVs."""
+    filter_complex = (
+        f"[0:a]volume={sys_volume}[a];[1:a]volume={mic_volume}[b];"
+        f"[a][b]amix=inputs=2:duration=longest:dropout_transition=2,"
+        f"aresample={sample_rate}"
+    )
+    return [
+        "ffmpeg", "-y",
+        "-i", sys_wav,
+        "-i", mic_wav,
+        "-filter_complex", filter_complex,
+        "-c:a", "aac", "-b:a", "96k",
+        out_path,
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# State / process helpers
+# --------------------------------------------------------------------------- #
+
+def ensure_config(path=CONFIG_FILE):
+    """Create the config file with defaults on first run, then load it."""
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cfg = configparser.ConfigParser()
+        cfg.read_dict(DEFAULTS)
+        with open(path, "w") as f:
+            cfg.write(f)
+    return load_config(path)
+
+
+def read_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def write_state(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def clear_state():
+    try:
+        os.remove(STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def session_live(state):
+    return bool(state) and any(pid_alive(p) for p in state.get("pids", []))
+
+
+def terminate(pids, timeout=5.0):
+    """SIGINT the pids, wait up to timeout, then SIGKILL survivors."""
+    for pid in pids:
+        if pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+    deadline = time.time() + timeout
+    while time.time() < deadline and any(pid_alive(p) for p in pids):
+        time.sleep(0.1)
+    for pid in pids:
+        if pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def notify(title, body=""):
+    try:
+        subprocess.run(["notify-send", title, body], check=False)
+    except FileNotFoundError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def cmd_start():
+    cfg = ensure_config()
+    state = read_state()
+    if state is not None:
+        if session_live(state):
+            print("Already recording (stop or toggle first).", file=sys.stderr)
+            return 1
+        clear_state()  # stale PIDs -> clean up and start fresh
+
+    sink = subprocess.check_output(
+        ["pactl", "get-default-sink"], text=True).strip()
+    source = subprocess.check_output(
+        ["pactl", "get-default-source"], text=True).strip()
+
+    rate = cfg.get("audio", "sample_rate")
+    start_unix = int(time.time())
+    sess_dir = os.path.join(CACHE_DIR, str(start_unix))
+    os.makedirs(sess_dir, exist_ok=True)
+    sys_wav = os.path.join(sess_dir, "sys.wav")
+    mic_wav = os.path.join(sess_dir, "mic.wav")
+
+    p_sys = subprocess.Popen(["pw-record", "--channels", "1", "--rate", rate,
+                              "--target", sink + ".monitor", sys_wav])
+    p_mic = subprocess.Popen(["pw-record", "--channels", "1", "--rate", rate,
+                              "--target", source, mic_wav])
+    write_state({"pids": [p_sys.pid, p_mic.pid], "start": start_unix,
+                 "session_dir": sess_dir, "sys_wav": sys_wav, "mic_wav": mic_wav})
+    notify("Recording started")
+    print("recording")
+    return 0
+
+
+def transcribe(path, cfg):
+    """Lazily import faster-whisper and transcribe; returns (segments, duration)."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("faster-whisper is not installed. Install it in your venv:\n"
+              "    pip install faster-whisper", file=sys.stderr)
+        sys.exit(3)
+    model = WhisperModel(cfg.get("whisper", "model"),
+                         device=cfg.get("whisper", "device"),
+                         compute_type=cfg.get("whisper", "compute_type"))
+    segments, info = model.transcribe(
+        path, beam_size=cfg.getint("whisper", "beam_size"), vad_filter=True)
+    segs = [(s.start, s.end, s.text) for s in segments]
+    return segs, getattr(info, "duration", 0.0)
+
+
+def write_transcripts(folder, segments, start_unix, duration):
+    lines = [format_segment(s, e, t) for s, e, t in segments]
+    body = "\n".join(lines) + ("\n" if lines else "")
+    with open(os.path.join(folder, "transcript.txt"), "w") as f:
+        f.write(body)
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start_unix))
+    with open(os.path.join(folder, "transcript.md"), "w") as f:
+        f.write(f"# Meeting {iso}\n\n")
+        f.write(f"Duration: {fmt_ts(duration)}\n\n")
+        f.write(body)
+
+
+def cmd_stop():
+    cfg = ensure_config()
+    state = read_state()
+    if state is None:
+        print("Not recording.", file=sys.stderr)
+        return 1
+
+    try:
+        terminate(state.get("pids", []))
+    finally:
+        clear_state()
+
+    sys_wav, mic_wav = state["sys_wav"], state["mic_wav"]
+    start_unix = state["start"]
+    mixed = os.path.join(state["session_dir"], "meeting.m4a")
+
+    cmd = build_ffmpeg_mix_cmd(
+        sys_wav, mic_wav, mixed,
+        cfg.getfloat("audio", "sys_volume"),
+        cfg.getfloat("audio", "mic_volume"),
+        cfg.getint("audio", "sample_rate"))
+    subprocess.run(cmd, check=True)
+
+    # Raw WAVs are disposable once the mix succeeds.
+    for raw in (sys_wav, mic_wav):
+        try:
+            os.remove(raw)
+        except FileNotFoundError:
+            pass
+
+    out_base = os.path.expanduser(cfg.get("paths", "output_dir"))
+    day = time.strftime("%Y-%m-%d", time.localtime(start_unix))
+    folder = os.path.join(out_base, day, session_dir_name(start_unix))
+    os.makedirs(folder, exist_ok=True)
+    final_m4a = os.path.join(folder, "meeting.m4a")
+    shutil.move(mixed, final_m4a)
+
+    segments, duration = transcribe(final_m4a, cfg)
+    write_transcripts(folder, segments, start_unix, duration)
+
+    notify("Recording done", folder)
+    print(folder)
+    return 0
+
+
+def cmd_toggle():
+    state = read_state()
+    if session_live(state):
+        return cmd_stop()
+    return cmd_start()
+
+
+def cmd_status():
+    state = read_state()
+    if session_live(state):
+        print(f"recording {int(time.time() - state['start'])}")
+        return 0
+    print("idle")
+    return 0
+
+
+COMMANDS = {"start": cmd_start, "stop": cmd_stop,
+            "toggle": cmd_toggle, "status": cmd_status}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] not in COMMANDS:
+        print("usage: meet-recorder start|stop|toggle|status", file=sys.stderr)
+        return 2
+    return COMMANDS[argv[0]]()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
