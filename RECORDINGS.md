@@ -11,8 +11,11 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
     └── HHMMSS-<source>[-<title>]/      one folder per recording, named by start time
         ├── meeting.m4a                 mixed audio: other people (speakers) + your mic
         ├── transcript.md               heading, duration, then the transcript
+        ├── me.m4a                      your microphone only
+        ├── others.m4a                  the call audio only (everyone else)
         ├── transcript.txt              transcript only, one line per utterance:
-        │                               [mm:ss -> mm:ss] text
+        │                               [mm:ss -> mm:ss] Me: text
+        │                               [mm:ss -> mm:ss] Others: text
         ├── meta.json                   start time, source, title, devices, model, status
         └── transcribe.log              transcription log (only useful if something failed)
 ```
@@ -21,7 +24,11 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
   `manual` (started from the bar icon or Super+Shift+R).
 - `<title>` is the Teams meeting window title when one could be read,
   e.g. `101502-teams-weekly-ops-sync`.
-- Folders from before 2026-11-23 12:00 are named `HHMMSS-meeting` and have no `meta.json`.
+- Speaker labels: `Me` is whatever your microphone picked up, `Others` is the
+  call audio. Individual participants are not told apart or named. When the
+  call plays through speakers, the mic's echo of the others is filtered out.
+- Folders from before 2026-11-23 12:00 are named `HHMMSS-meeting`, have no `meta.json`,
+  and their transcripts have no speaker labels.
 
 ## Finding things
 

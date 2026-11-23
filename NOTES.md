@@ -54,6 +54,10 @@ with faster-whisper. Zero network/cloud use at runtime.
   (default `teams`) holding the mic open == live call. It only stops sessions
   it started (`source: teams`), and won't restart one you stopped by hand
   until the next call.
+- Speaker labels: `stop` also saves `me.m4a` (mic) and `others.m4a` (sink).
+  `transcribe` runs whisper on each and `merge_speakers()` interleaves them as
+  `Me:` / `Others:`, dropping mic segments that are just speaker echo (word
+  overlap with what the others said within 3 s). No per-person diarization.
 - State: `~/.local/state/meet-recorder/` — `session.json` (live recording),
   `transcribing/` (job markers), `last.json`, `watch.json` (daemon heartbeat).
 - Default whisper model is `small` (~25x realtime on this CPU). `medium` is

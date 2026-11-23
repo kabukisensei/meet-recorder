@@ -161,5 +161,28 @@ class TestPickMeetingTitle(unittest.TestCase):
         self.assertEqual(mr.pick_meeting_title([]), "")
 
 
+class TestSpeakers(unittest.TestCase):
+    def test_format_with_speaker(self):
+        self.assertEqual(mr.format_segment(0, 5, " hi ", "Me"), "[00:00 -> 00:05] Me: hi")
+
+    def test_merge_orders_and_labels(self):
+        out = mr.merge_speakers([(5, 7, "Sounds good to me")],
+                                [(0, 4, "Can we ship on Friday?"), (8, 9, "Great")])
+        self.assertEqual([s[3] for s in out], ["Others", "Me", "Others"])
+
+    def test_drops_speaker_echo(self):
+        others = [(10, 14, "The quarterly numbers look strong this year")]
+        me = [(10.5, 14.5, "the quarterly numbers look strong this here"),
+              (15, 17, "I disagree about the forecast")]
+        out = mr.merge_speakers(me, others)
+        self.assertEqual([(s[3], s[2]) for s in out if s[3] == "Me"],
+                         [("Me", "I disagree about the forecast")])
+
+    def test_same_words_far_apart_are_kept(self):
+        out = mr.merge_speakers([(100, 102, "yes that works")],
+                                [(0, 2, "yes that works")])
+        self.assertEqual(len(out), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
