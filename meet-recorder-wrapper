@@ -1,0 +1,2 @@
+#!/bin/bash
+exec $HOME/venvs/meet-recorder/bin/python $HOME/.local/bin/meet-recorder.py "$@"

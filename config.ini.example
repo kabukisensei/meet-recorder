@@ -1,0 +1,14 @@
+[audio]
+sys_volume = 1.0
+mic_volume = 2.0
+sample_rate = 16000
+
+[whisper]
+model = base
+device = cpu
+compute_type = int8
+beam_size = 5
+
+[paths]
+output_dir = ~/Recordings
+

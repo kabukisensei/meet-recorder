@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "jennings.meetrecorder",
+  "name": "Meet Recorder indicator",
+  "version": "1.0.0",
+  "author": "Aaron Jennings",
+  "license": "MIT",
+  "description": "Red REC indicator with elapsed time while meet-recorder is capturing. Click to stop recording.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Meeting recorder",
+    "description": "REC indicator for meet-recorder; click to stop the recording.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
