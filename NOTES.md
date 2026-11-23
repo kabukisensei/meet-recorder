@@ -54,6 +54,10 @@ with faster-whisper. Zero network/cloud use at runtime.
   (default `teams`) holding the mic open == live call. It only stops sessions
   it started (`source: teams`), and won't restart one you stopped by hand
   until the next call.
+- Devices: the recorders run with no `--target`, so they follow the default
+  sink/source (verified: switching the default sink mid-recording re-links the
+  capture). They are pinned only if the call app itself uses a non-default
+  device (`app_device()`). Headphones therefore work, including mid-call swaps.
 - Speaker labels: `stop` also saves `me.m4a` (mic) and `others.m4a` (sink).
   `transcribe` runs whisper on each and `merge_speakers()` interleaves them as
   `Me:` / `Others:`, dropping mic segments that are just speaker echo (word

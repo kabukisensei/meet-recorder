@@ -184,5 +184,21 @@ class TestSpeakers(unittest.TestCase):
         self.assertEqual(len(out), 2)
 
 
+class TestAppDevice(unittest.TestCase):
+    DEVS = [{"index": 1, "name": "hdmi"}, {"index": 2, "name": "headset"}]
+
+    def stream(self, sink):
+        return {"sink": sink, "properties": {"application.process.binary": "teams-for-linux"}}
+
+    def test_follows_default_when_app_uses_it(self):
+        self.assertEqual(mr.app_device([self.stream(1)], self.DEVS, ["teams"], "sink", "hdmi"), "")
+
+    def test_pins_when_app_uses_other_device(self):
+        self.assertEqual(mr.app_device([self.stream(2)], self.DEVS, ["teams"], "sink", "hdmi"), "headset")
+
+    def test_no_app_stream(self):
+        self.assertEqual(mr.app_device([], self.DEVS, ["teams"], "sink", "hdmi"), "")
+
+
 if __name__ == "__main__":
     unittest.main()

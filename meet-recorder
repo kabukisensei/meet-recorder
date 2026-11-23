@@ -112,6 +112,22 @@ def call_streams(source_outputs, apps):
     return hits
 
 
+def app_device(streams, devices, apps, key, default):
+    """Device a watched app's stream is attached to, if it is not the default.
+
+    streams: `pactl -f json list sink-inputs` (key="sink") or source-outputs
+    (key="source"); devices: the matching `list sinks` / `list sources`.
+    Returns the device name to pin the recorder to, or "" to simply follow
+    the system default (which also follows a mid-call headphone switch).
+    """
+    names = {d.get("index"): d.get("name", "") for d in devices or []}
+    for st in call_streams(streams, apps):
+        name = names.get(st.get(key), "")
+        if name and not name.endswith(".monitor") and name != default:
+            return name
+    return ""
+
+
 def pick_meeting_title(titles):
     """Pick the most meeting-like window title and strip the app suffix."""
     cleaned = []
@@ -336,11 +352,25 @@ def cmd_start(args=(), source="manual"):
                  stderr=subprocess.DEVNULL, start_new_session=True)
     # Speaker side: capture the sink itself. (PipeWire has no "<sink>.monitor"
     # node -- targeting that name silently falls back to the microphone.)
-    p_sys = subprocess.Popen(["pw-record", "--channels", "1", "--rate", rate,
-                              "-P", "{ stream.capture.sink = true }",
-                              "--target", sink, sys_wav], **quiet)
-    p_mic = subprocess.Popen(["pw-record", "--channels", "1", "--rate", rate,
-                              "--target", mic, mic_wav], **quiet)
+    # With no --target the recorders follow the system default devices, so
+    # plugging in / switching to headphones mid-call keeps recording. Only
+    # when the call app was pointed at a non-default device do we pin to it.
+    apps = auto_apps(cfg)
+    pin_sink = app_device(
+        run_json(["pactl", "-f", "json", "list", "sink-inputs"], []),
+        run_json(["pactl", "-f", "json", "list", "sinks"], []),
+        apps, "sink", sink)
+    pin_mic = app_device(
+        run_json(["pactl", "-f", "json", "list", "source-outputs"], []),
+        run_json(["pactl", "-f", "json", "list", "sources"], []),
+        apps, "source", mic)
+    sink, mic = pin_sink or sink, pin_mic or mic
+    base = ["pw-record", "--channels", "1", "--rate", rate]
+    p_sys = subprocess.Popen(
+        base + ["-P", "{ stream.capture.sink = true }"]
+        + (["--target", pin_sink] if pin_sink else []) + [sys_wav], **quiet)
+    p_mic = subprocess.Popen(
+        base + (["--target", pin_mic] if pin_mic else []) + [mic_wav], **quiet)
     title = meeting_title(cfg)
     write_state({"pids": [p_sys.pid, p_mic.pid], "start": start_unix,
                  "session_dir": sess_dir, "sys_wav": sys_wav, "mic_wav": mic_wav,
