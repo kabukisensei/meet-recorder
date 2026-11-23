@@ -4,7 +4,7 @@ mic_volume = 2.0
 sample_rate = 16000
 
 [whisper]
-model = base
+model = small
 device = cpu
 compute_type = int8
 beam_size = 5
@@ -12,3 +12,9 @@ beam_size = 5
 [paths]
 output_dir = ~/Recordings
 
+[auto]
+enabled = true
+apps = teams
+poll_seconds = 2
+start_after_seconds = 4
+stop_after_seconds = 20

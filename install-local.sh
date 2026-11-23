@@ -6,9 +6,24 @@ cd "$(dirname "$0")"
 
 make check
 
+plugin=~/.config/omarchy/plugins/jennings.meetrecorder
+unit=~/.config/systemd/user/meet-recorder-watch.service
+
 install -m 755 meet-recorder        ~/.local/bin/meet-recorder.py
 install -m 755 meet-recorder-wrapper ~/.local/bin/meet-recorder
-install -m 644 omarchy-widget/BarWidget.qml  ~/.config/omarchy/plugins/jennings.meetrecorder/BarWidget.qml
-install -m 644 omarchy-widget/manifest.json  ~/.config/omarchy/plugins/jennings.meetrecorder/manifest.json
+install -d "$plugin"
+install -m 644 omarchy-widget/Panel.qml      "$plugin/Panel.qml"
+install -m 644 omarchy-widget/manifest.json  "$plugin/manifest.json"
+rm -f "$plugin/BarWidget.qml"   # replaced by Panel.qml in 2.0
+install -D -m 644 systemd/meet-recorder-watch.service "$unit"
+install -d ~/Recordings
+install -m 644 RECORDINGS.md ~/Recordings/README.md
 
-echo "synced: CLI -> ~/.local/bin, bar widget -> omarchy plugin dir"
+systemctl --user daemon-reload
+systemctl --user enable meet-recorder-watch.service
+systemctl --user restart meet-recorder-watch.service
+
+# Hot-reload keeps the old compiled QML; a shell restart reliably picks up the widget.
+omarchy restart shell >/dev/null 2>&1 || true
+
+echo "synced: CLI -> ~/.local/bin, bar widget -> omarchy plugin dir, watch service + shell restarted"

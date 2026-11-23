@@ -65,7 +65,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.get("audio", "sys_volume"), "1.0")
         self.assertEqual(cfg.get("audio", "mic_volume"), "2.0")
         self.assertEqual(cfg.getint("audio", "sample_rate"), 16000)
-        self.assertEqual(cfg.get("whisper", "model"), "base")
+        self.assertEqual(cfg.get("whisper", "model"), "small")
         self.assertEqual(cfg.getint("whisper", "beam_size"), 5)
         self.assertEqual(cfg.get("paths", "output_dir"), "~/Recordings")
 
@@ -114,6 +114,51 @@ class TestFfmpegMixCmd(unittest.TestCase):
             "[a][b]amix=inputs=2:duration=longest:dropout_transition=2,"
             "aresample=48000",
             cmd)
+
+
+class TestSlugify(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(mr.slugify("Weekly Sync: Ops & Sales!"), "weekly-sync-ops-sales")
+
+    def test_empty_and_length(self):
+        self.assertEqual(mr.slugify("***"), "")
+        self.assertLessEqual(len(mr.slugify("a b " * 50)), 40)
+        self.assertFalse(mr.slugify("a b " * 50).endswith("-"))
+
+
+class TestCallStreams(unittest.TestCase):
+    def so(self, **props):
+        return {"properties": props}
+
+    def test_matches_teams_binary_or_name(self):
+        outs = [self.so(**{"application.process.binary": "teams-for-linux",
+                           "application.name": "Chromium input"}),
+                self.so(**{"application.name": "Teams for Linux"}),
+                self.so(**{"application.process.binary": "chromium"})]
+        self.assertEqual(len(mr.call_streams(outs, ["teams"])), 2)
+
+    def test_ignores_own_recorder_and_others(self):
+        outs = [self.so(**{"application.name": "pw-record",
+                           "node.name": "pw-record teams"}),
+                self.so(**{"application.process.binary": "superwhisper"})]
+        self.assertEqual(mr.call_streams(outs, ["teams"]), [])
+
+    def test_empty(self):
+        self.assertEqual(mr.call_streams([], ["teams"]), [])
+        self.assertEqual(mr.call_streams(None, ["teams"]), [])
+
+
+class TestPickMeetingTitle(unittest.TestCase):
+    def test_prefers_meeting_like(self):
+        t = ["Chat | Tanner | Microsoft Teams",
+             "Meeting with Tanner | Microsoft Teams"]
+        self.assertEqual(mr.pick_meeting_title(t), "Meeting with Tanner")
+
+    def test_skips_generic_tabs(self):
+        self.assertEqual(mr.pick_meeting_title(["Chat | X | Microsoft Teams"]), "")
+        self.assertEqual(mr.pick_meeting_title(["Q4 Budget Review | Microsoft Teams"]),
+                         "Q4 Budget Review")
+        self.assertEqual(mr.pick_meeting_title([]), "")
 
 
 if __name__ == "__main__":

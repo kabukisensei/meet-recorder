@@ -38,7 +38,7 @@ Make sure `~/.local/bin` is on your `PATH`.
 
 ```sh
 meet-recorder start     # start recording (refuses if already recording)
-meet-recorder stop      # stop, mix, transcribe, print output folder
+meet-recorder stop      # stop, mix, print output folder; transcribes in the background
 meet-recorder toggle    # start if idle, stop if recording
 meet-recorder status    # "recording <elapsed-seconds>" or "idle"
 ```
@@ -110,8 +110,10 @@ make test     # unittest suite only
 The test suite (`tests/test_pure.py`) covers the pure functions only — no audio
 and no faster-whisper import required.
 
-## Non-goals
+## Bar widget, auto-record, output layout
 
-By design this tool does **not** include: a GUI, tray icon, or waybar widget;
-any network/upload/LLM summarization; a system-wide install or systemd unit;
-and no dependency-pinning files beyond this README note.
+See `NOTES.md` for the Omarchy bar widget and the `watch` service that
+auto-records Teams calls, and `RECORDINGS.md` for the output folder layout
+(`HHMMSS-<source>[-<title>]/` with `meeting.m4a`, `transcript.md`,
+`transcript.txt`, `meta.json`). Extra commands: `status --json`,
+`auto on|off|toggle`, `watch`, `transcribe <folder>`.

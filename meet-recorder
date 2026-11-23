@@ -9,6 +9,7 @@ network calls, ever. faster-whisper is imported lazily, only at transcribe time.
 import configparser
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
@@ -19,12 +20,19 @@ STATE_DIR = os.path.expanduser("~/.local/state/meet-recorder")
 STATE_FILE = os.path.join(STATE_DIR, "session.json")
 CACHE_DIR = os.path.expanduser("~/.cache/meet-recorder")
 CONFIG_FILE = os.path.expanduser("~/.config/meet-recorder/config.ini")
+JOBS_DIR = os.path.join(STATE_DIR, "transcribing")   # one marker per running job
+LAST_FILE = os.path.join(STATE_DIR, "last.json")     # most recent finished session
+WATCH_FILE = os.path.join(STATE_DIR, "watch.json")   # heartbeat of the auto-recorder
 
 DEFAULTS = {
     "audio": {"sys_volume": "1.0", "mic_volume": "2.0", "sample_rate": "16000"},
-    "whisper": {"model": "base", "device": "cpu",
+    "whisper": {"model": "small", "device": "cpu",
                 "compute_type": "int8", "beam_size": "5"},
     "paths": {"output_dir": "~/Recordings"},
+    # Auto-record: the `watch` daemon starts a recording when one of these
+    # apps opens the microphone (i.e. a call is live) and stops when it closes.
+    "auto": {"enabled": "true", "apps": "teams", "poll_seconds": "2",
+             "start_after_seconds": "4", "stop_after_seconds": "20"},
 }
 
 
@@ -47,6 +55,50 @@ def format_segment(start, end, text):
 def session_dir_name(start_unix, slug="meeting"):
     """Return 'HHMMSS-<slug>' for a session starting at start_unix (local time)."""
     return time.strftime("%H%M%S", time.localtime(start_unix)) + "-" + slug
+
+
+def slugify(text, max_len=40):
+    """Lowercase, dash-separated, filesystem-safe slug ('' if nothing usable)."""
+    slug = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+    return slug[:max_len].strip("-")
+
+
+def call_streams(source_outputs, apps):
+    """Return the mic-capture streams that belong to one of `apps`.
+
+    source_outputs: parsed `pactl -f json list source-outputs`.
+    apps: lowercase substrings matched against the stream's application name
+    and process binary. A matching app holding the mic open == a live call.
+    """
+    hits = []
+    for so in source_outputs or []:
+        props = so.get("properties", {}) or {}
+        hay = " ".join(str(props.get(k, "")) for k in (
+            "application.name", "application.process.binary",
+            "application.id", "node.name")).lower()
+        if "pw-record" in hay:
+            continue  # our own recorder
+        if any(a and a in hay for a in apps):
+            hits.append(so)
+    return hits
+
+
+def pick_meeting_title(titles):
+    """Pick the most meeting-like window title and strip the app suffix."""
+    cleaned = []
+    for t in titles:
+        t = re.sub(r"\s*\|\s*Microsoft Teams\s*$", "", t or "").strip()
+        if t:
+            cleaned.append(t)
+    if not cleaned:
+        return ""
+    for t in cleaned:
+        if re.search(r"meeting|call|standup|sync", t, re.I):
+            return t
+    for t in cleaned:
+        if not re.match(r"(chat|calendar|activity|teams|calls)\b", t, re.I):
+            return t
+    return ""
 
 
 def load_config(path=CONFIG_FILE):
@@ -156,21 +208,90 @@ def notify(title, body=""):
 
 
 # --------------------------------------------------------------------------- #
+# Environment probes (PipeWire / Hyprland)
+# --------------------------------------------------------------------------- #
+
+def run_json(argv, default):
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        return json.loads(out.stdout) if out.returncode == 0 else default
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return default
+
+
+def auto_apps(cfg):
+    return [a.strip().lower() for a in cfg.get("auto", "apps").split(",")
+            if a.strip()]
+
+
+def call_active(cfg):
+    """True when a watched app (Teams) currently holds the microphone open."""
+    outs = run_json(["pactl", "-f", "json", "list", "source-outputs"], [])
+    return bool(call_streams(outs, auto_apps(cfg)))
+
+
+def meeting_title(cfg):
+    apps = auto_apps(cfg)
+    clients = run_json(["hyprctl", "clients", "-j"], [])
+    titles = [c.get("title", "") for c in clients
+              if any(a in str(c.get("class", "")).lower() for a in apps)]
+    return pick_meeting_title(titles)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def active_jobs():
+    """Folders currently being transcribed (drops markers of dead jobs)."""
+    jobs = []
+    try:
+        names = os.listdir(JOBS_DIR)
+    except FileNotFoundError:
+        return jobs
+    for name in names:
+        path = os.path.join(JOBS_DIR, name)
+        job = read_json(path)
+        if job and pid_alive(job.get("pid", -1)):
+            jobs.append(job)
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return jobs
+
+
+# --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
 
-def cmd_start():
+def cmd_start(args=(), source="manual"):
     cfg = ensure_config()
+    if "--auto" in args:
+        source = "teams"
     state = read_state()
     if state is not None:
         if session_live(state):
             print("Already recording (stop or toggle first).", file=sys.stderr)
             return 1
-        clear_state()  # stale PIDs -> clean up and start fresh
+        recover_stale(state)
 
     sink = subprocess.check_output(
         ["pactl", "get-default-sink"], text=True).strip()
-    source = subprocess.check_output(
+    mic = subprocess.check_output(
         ["pactl", "get-default-source"], text=True).strip()
 
     rate = cfg.get("audio", "sample_rate")
@@ -180,13 +301,33 @@ def cmd_start():
     sys_wav = os.path.join(sess_dir, "sys.wav")
     mic_wav = os.path.join(sess_dir, "mic.wav")
 
+    # start_new_session: the recorders must outlive whatever launched us
+    # (keybind shell, bar widget, the watch daemon being restarted).
+    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                 stderr=subprocess.DEVNULL, start_new_session=True)
+    # Speaker side: capture the sink itself. (PipeWire has no "<sink>.monitor"
+    # node -- targeting that name silently falls back to the microphone.)
     p_sys = subprocess.Popen(["pw-record", "--channels", "1", "--rate", rate,
-                              "--target", sink + ".monitor", sys_wav])
+                              "-P", "{ stream.capture.sink = true }",
+                              "--target", sink, sys_wav], **quiet)
     p_mic = subprocess.Popen(["pw-record", "--channels", "1", "--rate", rate,
-                              "--target", source, mic_wav])
+                              "--target", mic, mic_wav], **quiet)
+    title = meeting_title(cfg)
     write_state({"pids": [p_sys.pid, p_mic.pid], "start": start_unix,
-                 "session_dir": sess_dir, "sys_wav": sys_wav, "mic_wav": mic_wav})
-    notify("Recording started")
+                 "session_dir": sess_dir, "sys_wav": sys_wav, "mic_wav": mic_wav,
+                 "source": source, "title": title, "sink": sink, "mic": mic})
+    time.sleep(0.4)
+    if not (pid_alive(p_sys.pid) and p_sys.poll() is None
+            and pid_alive(p_mic.pid) and p_mic.poll() is None):
+        terminate([p_sys.pid, p_mic.pid], timeout=1)
+        clear_state()
+        notify("Meeting recorder: could not start",
+               "pw-record failed to open the speaker or microphone.")
+        print("failed to start recorders", file=sys.stderr)
+        return 1
+    notify("● Recording started",
+           (title or ("Teams call" if source == "teams" else "Manual recording"))
+           + "\nStop: click the mic icon in the bar, or Super+Shift+R")
     print("recording")
     return 0
 
@@ -208,89 +349,276 @@ def transcribe(path, cfg):
     return segs, getattr(info, "duration", 0.0)
 
 
-def write_transcripts(folder, segments, start_unix, duration):
+def write_transcripts(folder, segments, start_unix, duration, title=""):
     lines = [format_segment(s, e, t) for s, e, t in segments]
     body = "\n".join(lines) + ("\n" if lines else "")
     with open(os.path.join(folder, "transcript.txt"), "w") as f:
         f.write(body)
     iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start_unix))
     with open(os.path.join(folder, "transcript.md"), "w") as f:
-        f.write(f"# Meeting {iso}\n\n")
+        f.write(f"# {title or 'Meeting'} {iso}\n\n")
         f.write(f"Duration: {fmt_ts(duration)}\n\n")
-        f.write(body)
+        f.write(body if body else "_No speech detected._\n")
 
 
-def cmd_stop():
+def finalize_audio(state, cfg):
+    """Mix the raw tracks into the output folder; returns the folder path."""
+    sys_wav, mic_wav = state["sys_wav"], state["mic_wav"]
+    start_unix = state["start"]
+    sess_dir = state["session_dir"]
+    have = [w for w in (sys_wav, mic_wav)
+            if os.path.exists(w) and os.path.getsize(w) > 1024]
+    if not have:
+        raise RuntimeError("no audio was captured")
+
+    source = state.get("source", "manual")
+    title = state.get("title", "")
+    slug = "-".join(x for x in (source, slugify(title)) if x) or "meeting"
+    out_base = os.path.expanduser(cfg.get("paths", "output_dir"))
+    day = time.strftime("%Y-%m-%d", time.localtime(start_unix))
+    folder = os.path.join(out_base, day, session_dir_name(start_unix, slug))
+    os.makedirs(folder, exist_ok=True)
+    final_m4a = os.path.join(folder, "meeting.m4a")
+
+    if len(have) == 2:
+        cmd = build_ffmpeg_mix_cmd(
+            sys_wav, mic_wav, final_m4a,
+            cfg.getfloat("audio", "sys_volume"),
+            cfg.getfloat("audio", "mic_volume"),
+            cfg.getint("audio", "sample_rate"))
+    else:  # one track is missing/empty: keep what we have
+        cmd = ["ffmpeg", "-y", "-i", have[0], "-c:a", "aac", "-b:a", "96k",
+               final_m4a]
+    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Raw WAVs are disposable once the mix succeeds.
+    shutil.rmtree(sess_dir, ignore_errors=True)
+
+    write_json(os.path.join(folder, "meta.json"), {
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                 time.localtime(start_unix)),
+        "source": source, "title": title,
+        "tracks": [os.path.basename(w) for w in have],
+        "speaker_device": state.get("sink", ""),
+        "mic_device": state.get("mic", ""),
+        "audio": "meeting.m4a", "transcript": "transcript.md",
+        "transcript_status": "pending",
+    })
+    return folder
+
+
+def spawn_transcribe(folder):
+    """Transcribe in a detached process so nothing that launched us can kill it."""
+    log = open(os.path.join(folder, "transcribe.log"), "w")
+    subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                      "transcribe", folder],
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True)
+
+
+def recover_stale(state):
+    """A previous session died (crash/reboot) — save whatever audio it left."""
+    clear_state()
+    try:
+        folder = finalize_audio(state, ensure_config())
+    except Exception:
+        return
+    spawn_transcribe(folder)
+    notify("Meeting recorder", "Recovered an interrupted recording:\n" + folder)
+
+
+def cmd_stop(args=()):
     cfg = ensure_config()
     state = read_state()
     if state is None:
         print("Not recording.", file=sys.stderr)
         return 1
-
     try:
         terminate(state.get("pids", []))
     finally:
         clear_state()
-
-    sys_wav, mic_wav = state["sys_wav"], state["mic_wav"]
-    start_unix = state["start"]
-    mixed = os.path.join(state["session_dir"], "meeting.m4a")
-
-    cmd = build_ffmpeg_mix_cmd(
-        sys_wav, mic_wav, mixed,
-        cfg.getfloat("audio", "sys_volume"),
-        cfg.getfloat("audio", "mic_volume"),
-        cfg.getint("audio", "sample_rate"))
-    subprocess.run(cmd, check=True)
-
-    # Raw WAVs are disposable once the mix succeeds.
-    for raw in (sys_wav, mic_wav):
-        try:
-            os.remove(raw)
-        except FileNotFoundError:
-            pass
-
-    out_base = os.path.expanduser(cfg.get("paths", "output_dir"))
-    day = time.strftime("%Y-%m-%d", time.localtime(start_unix))
-    folder = os.path.join(out_base, day, session_dir_name(start_unix))
-    os.makedirs(folder, exist_ok=True)
-    final_m4a = os.path.join(folder, "meeting.m4a")
-    shutil.move(mixed, final_m4a)
-
-    segments, duration = transcribe(final_m4a, cfg)
-    write_transcripts(folder, segments, start_unix, duration)
-
-    notify("Recording done", folder)
+    try:
+        folder = finalize_audio(state, cfg)
+    except Exception as e:
+        notify("Meeting recorder: saving failed", str(e))
+        print(f"saving failed: {e}", file=sys.stderr)
+        return 1
+    write_json(LAST_FILE, {"folder": folder, "status": "transcribing"})
+    spawn_transcribe(folder)
+    notify("Recording saved — transcribing…", folder)
     print(folder)
     return 0
 
 
-def cmd_toggle():
-    state = read_state()
-    if session_live(state):
+def cmd_transcribe(args=()):
+    """Transcribe (or re-transcribe) a session folder's meeting.m4a."""
+    if not args:
+        print("usage: meet-recorder transcribe <session-folder>", file=sys.stderr)
+        return 2
+    cfg = ensure_config()
+    folder = os.path.abspath(os.path.expanduser(args[0]))
+    audio = os.path.join(folder, "meeting.m4a")
+    meta_path = os.path.join(folder, "meta.json")
+    meta = read_json(meta_path) or {}
+    marker = os.path.join(JOBS_DIR, f"{os.getpid()}.json")
+    write_json(marker, {"pid": os.getpid(), "folder": folder})
+    status = "failed"
+    try:
+        segments, duration = transcribe(audio, cfg)
+        start = os.path.getmtime(audio) - duration
+        try:
+            start = time.mktime(time.strptime(meta["started"][:19],
+                                              "%Y-%m-%dT%H:%M:%S"))
+        except (KeyError, ValueError):
+            pass
+        write_transcripts(folder, segments, start, duration,
+                          meta.get("title", ""))
+        status = "done" if segments else "no-speech"
+        meta.update({"duration_seconds": round(duration),
+                     "whisper_model": cfg.get("whisper", "model")})
+        notify("Transcript ready" if segments else "Recording saved (no speech found)",
+               folder)
+    except Exception as e:
+        notify("Meeting recorder: transcription failed",
+               f"{e}\nAudio is safe in {folder}")
+        raise
+    finally:
+        meta["transcript_status"] = status
+        write_json(meta_path, meta)
+        last = read_json(LAST_FILE) or {}
+        if last.get("folder") == folder:
+            write_json(LAST_FILE, {"folder": folder, "status": status})
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+    print(folder)
+    return 0
+
+
+def cmd_toggle(args=()):
+    if session_live(read_state()):
         return cmd_stop()
     return cmd_start()
 
 
-def cmd_status():
-    state = read_state()
-    if session_live(state):
-        print(f"recording {int(time.time() - state['start'])}")
-        return 0
-    print("idle")
+def auto_enabled(cfg):
+    return cfg.getboolean("auto", "enabled", fallback=True)
+
+
+def cmd_auto(args=()):
+    """auto on|off|toggle|status — whether Teams calls are recorded automatically."""
+    cfg = ensure_config()
+    want = args[0] if args else "status"
+    if want in ("on", "off", "toggle"):
+        new = (not auto_enabled(cfg)) if want == "toggle" else want == "on"
+        cfg.set("auto", "enabled", "true" if new else "false")
+        with open(CONFIG_FILE, "w") as f:
+            cfg.write(f)
+    print("on" if auto_enabled(cfg) else "off")
     return 0
 
 
-COMMANDS = {"start": cmd_start, "stop": cmd_stop,
-            "toggle": cmd_toggle, "status": cmd_status}
+def status_dict():
+    cfg = load_config()
+    state = read_state()
+    live = session_live(state)
+    jobs = active_jobs()
+    watch = read_json(WATCH_FILE) or {}
+    watching = (pid_alive(watch.get("pid", -1))
+                and time.time() - watch.get("beat", 0) < 30)
+    last = read_json(LAST_FILE) or {}
+    return {
+        "state": "recording" if live else ("transcribing" if jobs else "idle"),
+        "elapsed": int(time.time() - state["start"]) if live else 0,
+        "source": state.get("source", "manual") if live else "",
+        "title": state.get("title", "") if live else "",
+        "transcribing": len(jobs),
+        "auto": auto_enabled(cfg),
+        "watching": watching,
+        "in_call": bool(watch.get("in_call")) if watching else False,
+        "last_folder": last.get("folder", ""),
+        "last_status": last.get("status", ""),
+        "output_dir": os.path.expanduser(cfg.get("paths", "output_dir")),
+    }
+
+
+def cmd_status(args=()):
+    st = status_dict()
+    if "--json" in args:
+        print(json.dumps(st))
+    elif st["state"] == "recording":
+        print(f"recording {st['elapsed']}")
+    else:
+        print(st["state"])
+    return 0
+
+
+def cmd_watch(args=()):
+    """Daemon: record automatically while a watched app (Teams) is in a call.
+
+    Only stops recordings it started itself. If you stop an auto-recording by
+    hand mid-call, it stays stopped until the next call.
+    """
+    cfg = ensure_config()
+    state = read_state()
+    if state is not None and not session_live(state):
+        recover_stale(state)
+
+    seen_since = None      # when the call was first seen
+    gone_since = None      # when the call was last seen ending
+    handled = False        # this call was already recorded (or declined)
+    cfg_mtime = 0
+    while True:
+        try:
+            mtime = os.path.getmtime(CONFIG_FILE)
+        except OSError:
+            mtime = 0
+        if mtime != cfg_mtime:
+            cfg, cfg_mtime = load_config(), mtime
+        now = time.time()
+        in_call = call_active(cfg)
+        state = read_state()
+        live = session_live(state)
+
+        if in_call:
+            gone_since = None
+            seen_since = seen_since or now
+            if live:
+                handled = True   # something is already recording this call
+            elif (not handled and auto_enabled(cfg) and now - seen_since
+                    >= cfg.getfloat("auto", "start_after_seconds")):
+                handled = True
+                cmd_start(source="teams")
+        else:
+            seen_since = None
+            if handled or live:
+                gone_since = gone_since or now
+                if now - gone_since >= cfg.getfloat("auto", "stop_after_seconds"):
+                    if live and state.get("source") == "teams":
+                        cmd_stop()
+                    handled, gone_since = False, None
+            else:
+                handled, gone_since = False, None
+
+        write_json(WATCH_FILE, {"pid": os.getpid(), "beat": int(now),
+                                "in_call": in_call})
+        time.sleep(max(0.5, cfg.getfloat("auto", "poll_seconds")))
+
+
+COMMANDS = {"start": cmd_start, "stop": cmd_stop, "toggle": cmd_toggle,
+            "status": cmd_status, "auto": cmd_auto, "watch": cmd_watch,
+            "transcribe": cmd_transcribe}
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] not in COMMANDS:
-        print("usage: meet-recorder start|stop|toggle|status", file=sys.stderr)
+        print("usage: meet-recorder start|stop|toggle|status [--json]|"
+              "auto on|off|toggle|watch|transcribe <folder>", file=sys.stderr)
         return 2
-    return COMMANDS[argv[0]]()
+    return COMMANDS[argv[0]](argv[1:])
 
 
 if __name__ == "__main__":

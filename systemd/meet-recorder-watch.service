@@ -1,0 +1,14 @@
+[Unit]
+Description=Meeting recorder: auto-record Teams calls
+After=pipewire.service pipewire-pulse.service graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/meet-recorder watch
+Restart=always
+RestartSec=5
+# Leave an in-flight recording/transcription alone when the service restarts.
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target
