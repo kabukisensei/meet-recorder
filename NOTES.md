@@ -70,6 +70,18 @@ with faster-whisper. Zero network/cloud use at runtime.
 - Default whisper model is `small` (~25x realtime on this CPU). `medium` is
   more accurate and still practical; set `[whisper] model` in config.ini.
 
+## FocusTime export
+
+- Every transcription also writes `transcript.vtt` (Teams-style WebVTT:
+  `HH:MM:SS.mmm` timings, `<v Name>text</v>` cues, `&<>` escaped) and
+  `segments.json` (exact float timings for later features). FocusTime's
+  Calls drop zone imports the `.vtt` as if Teams made it.
+- Voice names come from `[speakers] me` / `others` (defaults `Me` / `Others`);
+  unlabelled segments (single-track / old recordings) use `others`.
+- `meet-recorder export <folder>...` backfills old folders: uses
+  `segments.json` if present, else parses `transcript.md` (second precision).
+  Idempotent. Validate with `ffmpeg -v error -i transcript.vtt -f srt -`.
+
 ## Known quirks
 
 - The Teams match was verified with a simulated mic client, not yet with a

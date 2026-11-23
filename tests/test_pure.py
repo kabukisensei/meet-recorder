@@ -200,5 +200,149 @@ class TestAppDevice(unittest.TestCase):
         self.assertEqual(mr.app_device([], self.DEVS, ["teams"], "sink", "hdmi"), "")
 
 
+class TestVttTimestamp(unittest.TestCase):
+    def test_zero_and_hours_always_present(self):
+        self.assertEqual(mr.fmt_vtt_ts(0), "00:00:00.000")
+        self.assertEqual(mr.fmt_vtt_ts(65.5), "00:01:05.500")
+
+    def test_hour_rollover(self):
+        self.assertEqual(mr.fmt_vtt_ts(3599.999), "00:59:59.999")
+        self.assertEqual(mr.fmt_vtt_ts(3600), "01:00:00.000")
+        self.assertEqual(mr.fmt_vtt_ts(3725.25), "01:02:05.250")
+
+    def test_ms_rounding(self):
+        self.assertEqual(mr.fmt_vtt_ts(1.2345), "00:00:01.234")
+        self.assertEqual(mr.fmt_vtt_ts(1.2346), "00:00:01.235")
+        self.assertEqual(mr.fmt_vtt_ts(59.9996), "00:01:00.000")
+
+    def test_never_negative(self):
+        self.assertEqual(mr.fmt_vtt_ts(-0.3), "00:00:00.000")
+
+
+def seg(start, end, text, speaker=""):
+    return {"start": start, "end": end, "speaker": speaker, "text": text}
+
+
+class TestSegmentsToVtt(unittest.TestCase):
+    def test_exact_output(self):
+        vtt = mr.segments_to_vtt([seg(0.0, 2.5, "Hi", "Others"),
+                                  seg(3.0, 4.0, "Hello", "Me")])
+        self.assertEqual(vtt,
+                         "WEBVTT\n\n"
+                         "1\n00:00:00.000 --> 00:00:02.500\n<v Others>Hi</v>\n\n"
+                         "2\n00:00:03.000 --> 00:00:04.000\n<v Me>Hello</v>\n")
+
+    def test_escaping_and_arrow(self):
+        vtt = mr.segments_to_vtt([seg(0, 1, "a & b <tag> --> c")])
+        self.assertIn("a &amp; b &lt;tag&gt; --&gt; c", vtt)
+        body = vtt.split("\n", 2)[2]
+        cue_text = [l for l in body.splitlines() if l.startswith("<v ")]
+        self.assertTrue(all("-->" not in l for l in cue_text))
+
+    def test_empty_text_skipped_and_numbering(self):
+        vtt = mr.segments_to_vtt([seg(0, 1, "  "), seg(1, 2, "\n"),
+                                  seg(2, 3, "kept")])
+        self.assertEqual(vtt.count("<v "), 1)
+        self.assertIn("1\n00:00:02.000 --> 00:00:03.000\n", vtt)
+
+    def test_empty_list(self):
+        self.assertEqual(mr.segments_to_vtt([]), "WEBVTT\n\n")
+
+    def test_sorted_by_start(self):
+        vtt = mr.segments_to_vtt([seg(10, 11, "second"), seg(2, 3, "first")])
+        self.assertLess(vtt.index("first"), vtt.index("second"))
+        self.assertIn("1\n00:00:02.000", vtt)
+
+    def test_end_clamped_and_newlines_collapsed(self):
+        vtt = mr.segments_to_vtt([seg(5, 4, "line one\n\nline two")])
+        self.assertIn("00:00:05.000 --> 00:00:05.000", vtt)
+        self.assertIn("<v Others>line one line two</v>", vtt)
+
+    def test_speaker_name_mapping(self):
+        vtt = mr.segments_to_vtt([seg(0, 1, "a", "Me"), seg(1, 2, "b", "Others"),
+                                  seg(2, 3, "c", "")],
+                                 me="Ser Nine", others="Tanner")
+        self.assertIn("<v Ser Nine>a</v>", vtt)
+        self.assertIn("<v Tanner>b</v>", vtt)
+        self.assertIn("<v Tanner>c</v>", vtt)  # unlabelled -> others
+
+    def test_config_default_speakers(self):
+        cfg = mr.load_config("/nonexistent/path.ini")
+        self.assertEqual(cfg.get("speakers", "me"), "Me")
+        self.assertEqual(cfg.get("speakers", "others"), "Others")
+
+
+class TestSegmentDicts(unittest.TestCase):
+    def test_tuples_keep_float_precision(self):
+        out = mr.segment_dicts([(0.123456, 1.5, " hi ", "Me"), (2, 3, "x")])
+        self.assertEqual(out, [
+            {"start": 0.123456, "end": 1.5, "speaker": "Me", "text": "hi"},
+            {"start": 2.0, "end": 3.0, "speaker": "", "text": "x"}])
+
+
+class TestParseMdLine(unittest.TestCase):
+    def test_labelled(self):
+        self.assertEqual(mr.parse_md_line("[01:05 -> 01:09] Me: hello there\n"),
+                         seg(65.0, 69.0, "hello there", "Me"))
+
+    def test_minutes_over_59(self):
+        d = mr.parse_md_line("[61:01 -> 125:30] Others: long call")
+        self.assertEqual((d["start"], d["end"], d["speaker"]),
+                         (3661.0, 7530.0, "Others"))
+
+    def test_unlabelled(self):
+        self.assertEqual(mr.parse_md_line("[00:00 -> 00:05] Note: not a speaker"),
+                         seg(0.0, 5.0, "Note: not a speaker", ""))
+
+    def test_skips_headers_and_blanks(self):
+        for line in ("# Meeting 2026-11-23T16:51:50", "", "Duration: 44:47",
+                     "_No speech detected._"):
+            self.assertIsNone(mr.parse_md_line(line))
+
+    def test_roundtrip_with_format_segment(self):
+        line = mr.format_segment(3725.7, 3730.2, "text", "Others")
+        self.assertEqual(mr.parse_md_line(line),
+                         seg(3725.0, 3730.0, "text", "Others"))
+
+
+class TestWriteTranscripts(unittest.TestCase):
+    def test_md_txt_unchanged_plus_vtt_and_segments(self):
+        import json
+        segs = [(0.25, 4.75, " Hi there ", "Others"), (5.5, 7.125, "Yo", "Me")]
+        cfg = mr.load_config("/nonexistent/path.ini")
+        with tempfile.TemporaryDirectory() as d:
+            mr.write_transcripts(d, segs, 1_700_000_000, 65.4, "Sync", cfg)
+            body = "[00:00 -> 00:04] Others: Hi there\n[00:05 -> 00:07] Me: Yo\n"
+            self.assertEqual(open(os.path.join(d, "transcript.txt")).read(), body)
+            iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(1_700_000_000))
+            self.assertEqual(open(os.path.join(d, "transcript.md")).read(),
+                             f"# Sync {iso}\n\nDuration: 01:05\n\n" + body)
+            self.assertEqual(json.load(open(os.path.join(d, "segments.json")))[1],
+                             {"start": 5.5, "end": 7.125, "speaker": "Me", "text": "Yo"})
+            vtt = open(os.path.join(d, "transcript.vtt")).read()
+            self.assertIn("00:00:05.500 --> 00:00:07.125\n<v Me>Yo</v>", vtt)
+
+
+class TestExport(unittest.TestCase):
+    def test_backfill_from_md_and_missing(self):
+        import contextlib, io, json
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "transcript.md"), "w") as f:
+                f.write("# Meeting x\n\nDuration: 00:10\n\n"
+                        "[00:05 -> 00:09] Me: b\n[00:00 -> 00:04] a\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(mr.cmd_export([d]), 0)
+                first = open(os.path.join(d, "transcript.vtt")).read()
+                self.assertEqual(mr.cmd_export([d]), 0)  # idempotent
+            self.assertEqual(open(os.path.join(d, "transcript.vtt")).read(), first)
+            self.assertLess(first.index(">a<"), first.index(">b<"))
+            segs = json.load(open(os.path.join(d, "segments.json")))
+            self.assertEqual(len(segs), 2)
+            empty = os.path.join(d, "empty")
+            os.mkdir(empty)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(mr.cmd_export([empty]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

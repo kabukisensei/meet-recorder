@@ -19,6 +19,12 @@ poll_seconds = 2
 start_after_seconds = 4
 stop_after_seconds = 20
 
+[speakers]
+# Names used in transcript.vtt voice tags (FocusTime export).
+# `others` is also used for unlabelled (single-track) segments.
+me = Me
+others = Others
+
 [summary]
 # Command run (detached) after a successful transcription.
 # {folder} is replaced with the session folder. Leave empty to disable.

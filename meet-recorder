@@ -33,6 +33,9 @@ DEFAULTS = {
     # a successful transcription; {folder} is replaced with the session
     # folder. Example: "summary_cmd": "meet-recorder-summarize {folder}"
     "summary": {"summary_cmd": ""},
+    # Names written into transcript.vtt voice tags (<v Name>) for the mic
+    # track and the call track; unlabelled segments use `others`.
+    "speakers": {"me": "Me", "others": "Others"},
     # Auto-record: the `watch` daemon starts a recording when one of these
     # apps opens the microphone (i.e. a call is live) and stops when it closes.
     "auto": {"enabled": "true", "apps": "teams", "poll_seconds": "2",
@@ -55,6 +58,88 @@ def format_segment(start, end, text, speaker=""):
     """Format one utterance as '[mm:ss -> mm:ss] [Speaker: ]text'."""
     who = f"{speaker}: " if speaker else ""
     return f"[{fmt_ts(start)} -> {fmt_ts(end)}] {who}{text.strip()}"
+
+
+def fmt_vtt_ts(seconds):
+    """Format seconds as WebVTT 'HH:MM:SS.mmm' (hours always present, >= 0)."""
+    ms = int(round(max(0.0, float(seconds)) * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def vtt_escape(text):
+    """Escape text for a VTT cue; collapses whitespace (no blank lines/newlines).
+
+    Escaping '>' also guarantees '-->' can never appear in the output.
+    """
+    text = " ".join(str(text).split())
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def segment_dicts(segments):
+    """(start, end, text[, speaker]) tuples -> segments.json-style dicts."""
+    out = []
+    for seg in segments:
+        start, end, text = seg[0], seg[1], seg[2]
+        speaker = seg[3] if len(seg) > 3 else ""
+        out.append({"start": float(start), "end": float(end),
+                    "speaker": speaker or "", "text": str(text).strip()})
+    return out
+
+
+def speaker_name(label, me="Me", others="Others"):
+    """Map a segment label ('Me' / 'Others' / '') to a display name."""
+    if label == "Me":
+        return me
+    if label == "Others" or not label:
+        return others
+    return label
+
+
+def segments_to_vtt(segments, me="Me", others="Others"):
+    """Build a Teams-style WebVTT transcript from segment dicts.
+
+    Cues are sorted by start time, numbered from 1, empty texts are skipped,
+    and end is clamped to >= start.
+    """
+    cues = []
+    ordered = sorted(segments, key=lambda d: (max(0.0, float(d["start"])),
+                                              float(d["end"])))
+    for d in ordered:
+        text = vtt_escape(d.get("text", ""))
+        if not text:
+            continue
+        start = max(0.0, float(d["start"]))
+        end = max(start, float(d["end"]))
+        name = vtt_escape(speaker_name(d.get("speaker", ""), me, others))
+        cues.append(f"{len(cues) + 1}\n{fmt_vtt_ts(start)} --> {fmt_vtt_ts(end)}\n"
+                    f"<v {name}>{text}</v>\n")
+    return "WEBVTT\n\n" + "\n".join(cues)
+
+
+_MD_LINE = re.compile(r"^\[(\d+):(\d{2}) -> (\d+):(\d{2})\] ?(.*)$")
+_MD_SPEAKER = re.compile(r"^(Me|Others): (.*)$")
+
+
+def parse_md_line(line):
+    """Parse a transcript.md/.txt line '[mm:ss -> mm:ss] [Speaker: ]text'.
+
+    Returns a segment dict, or None for headers / blank / other lines.
+    Only the labels the recorder writes ('Me', 'Others') count as speakers.
+    """
+    m = _MD_LINE.match(line.strip())
+    if not m:
+        return None
+    start = int(m.group(1)) * 60 + int(m.group(2))
+    end = int(m.group(3)) * 60 + int(m.group(4))
+    text, speaker = m.group(5).strip(), ""
+    sm = _MD_SPEAKER.match(text)
+    if sm:
+        speaker, text = sm.group(1), sm.group(2).strip()
+    return {"start": float(start), "end": float(end),
+            "speaker": speaker, "text": text}
 
 
 def _words(text):
@@ -418,7 +503,21 @@ def transcribe(paths, cfg):
     return results
 
 
-def write_transcripts(folder, segments, start_unix, duration, title=""):
+def write_vtt(folder, seg_dicts, cfg):
+    """Write transcript.vtt (FocusTime / Teams format); returns its path."""
+    path = os.path.join(folder, "transcript.vtt")
+    with open(path, "w") as f:
+        f.write(segments_to_vtt(seg_dicts,
+                                cfg.get("speakers", "me", fallback="Me"),
+                                cfg.get("speakers", "others", fallback="Others")))
+    return path
+
+
+def write_transcripts(folder, segments, start_unix, duration, title="",
+                      cfg=None):
+    seg_dicts = segment_dicts(segments)
+    write_json(os.path.join(folder, "segments.json"), seg_dicts)
+    write_vtt(folder, seg_dicts, cfg or load_config())
     lines = [format_segment(*seg) for seg in segments]
     body = "\n".join(lines) + ("\n" if lines else "")
     with open(os.path.join(folder, "transcript.txt"), "w") as f:
@@ -564,7 +663,7 @@ def cmd_transcribe(args=()):
         except (KeyError, ValueError):
             pass
         write_transcripts(folder, segments, start, duration,
-                          meta.get("title", ""))
+                          meta.get("title", ""), cfg)
         status = "done" if segments else "no-speech"
         summary_cmd = cfg.get("summary", "summary_cmd", fallback="").strip()
         if status == "done" and summary_cmd:
@@ -589,6 +688,36 @@ def cmd_transcribe(args=()):
             pass
     print(folder)
     return 0
+
+
+def cmd_export(args=()):
+    """Backfill transcript.vtt (+ segments.json) for existing session folders."""
+    if not args:
+        print("usage: meet-recorder export <session-folder> [<folder>...]",
+              file=sys.stderr)
+        return 2
+    cfg = load_config()
+    rc = 0
+    for arg in args:
+        folder = os.path.abspath(os.path.expanduser(arg))
+        seg_path = os.path.join(folder, "segments.json")
+        md_path = os.path.join(folder, "transcript.md")
+        segs = read_json(seg_path)
+        if not isinstance(segs, list):
+            segs = None
+            try:
+                with open(md_path) as f:
+                    segs = [d for d in map(parse_md_line, f) if d]
+            except OSError:
+                pass
+            if segs is None:
+                print(f"{folder}: no segments.json or transcript.md to export",
+                      file=sys.stderr)
+                rc = 1
+                continue
+            write_json(seg_path, segs)
+        print(write_vtt(folder, segs, cfg))
+    return rc
 
 
 def cmd_toggle(args=()):
@@ -703,14 +832,15 @@ def cmd_watch(args=()):
 
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "toggle": cmd_toggle,
             "status": cmd_status, "auto": cmd_auto, "watch": cmd_watch,
-            "transcribe": cmd_transcribe}
+            "transcribe": cmd_transcribe, "export": cmd_export}
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] not in COMMANDS:
         print("usage: meet-recorder start|stop|toggle|status [--json]|"
-              "auto on|off|toggle|watch|transcribe <folder>", file=sys.stderr)
+              "auto on|off|toggle|watch|transcribe <folder>|"
+              "export <folder>...", file=sys.stderr)
         return 2
     return COMMANDS[argv[0]](argv[1:])
 

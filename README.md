@@ -115,5 +115,7 @@ and no faster-whisper import required.
 See `NOTES.md` for the Omarchy bar widget and the `watch` service that
 auto-records Teams calls, and `RECORDINGS.md` for the output folder layout
 (`HHMMSS-<source>[-<title>]/` with `meeting.m4a`, `transcript.md`,
-`transcript.txt`, `meta.json`). Extra commands: `status --json`,
-`auto on|off|toggle`, `watch`, `transcribe <folder>`.
+`transcript.txt`, `transcript.vtt`, `segments.json`, `meta.json`). Extra
+commands: `status --json`, `auto on|off|toggle`, `watch`, `transcribe <folder>`,
+`export <folder>...` (backfill `transcript.vtt` + `segments.json` for older
+recordings; Teams-format WebVTT that FocusTime imports).

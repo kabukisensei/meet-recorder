@@ -16,6 +16,10 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
         ├── transcript.txt              transcript only, one line per utterance:
         │                               [mm:ss -> mm:ss] Me: text
         │                               [mm:ss -> mm:ss] Others: text
+        ├── transcript.vtt              Teams-style WebVTT transcript (<v Speaker>text</v>);
+        │                               drop it into FocusTime (Calls → drop zone)
+        ├── segments.json               every utterance with exact float start/end,
+        │                               speaker ("Me", "Others" or "") and text
         ├── meta.json                   start time, source, title, devices, model, status
         └── transcribe.log              transcription log (only useful if something failed)
 ```
@@ -37,6 +41,9 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
 - Search every transcript: `grep -ril "budget" ~/Recordings --include=transcript.txt`
 - `meta.json` → `transcript_status` is `pending`, `done`, `no-speech` or `failed`.
   Re-run a transcript with `meet-recorder transcribe <folder>`.
+- Older recordings without `transcript.vtt`: `meet-recorder export <folder>...`
+  builds it (and `segments.json`) from the existing transcript.
+  The VTT speaker names come from `[speakers] me / others` in config.ini.
 
 ## How recording works
 
