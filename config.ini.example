@@ -41,6 +41,9 @@ interval_seconds = 3
 # the calm cells differ from the last kept frame by > cell_change_threshold,
 # or their mean difference is >= change_threshold). Nothing is kept while
 # more than max_volatile of the window is volatile (full-screen video).
+# A tick on which >= burst_fraction of the cells start moving after 2 still
+# ticks is a transition (slide change, fade): those moves, and the cells'
+# next transition_ticks - 1 moves, are not counted as video.
 stable_threshold = 0.02
 cell_change_threshold = 0.02
 change_fraction = 0.03
@@ -48,11 +51,15 @@ change_threshold = 0.005
 volatile_ticks = 2
 volatile_window = 5
 max_volatile = 0.85
+burst_fraction = 0.1
+transition_ticks = 2
 settle_ticks = 2
 min_gap_seconds = 10
 max_frames = 300
 # Disk guards: stop keeping frames past max_mb, or when the disk would have
-# less than min_free_mb left (the audio shares that disk).
+# less than min_free_mb left (the audio shares that disk). Copying frames
+# into the recording folder also stops before that disk drops below
+# min_free_mb (the transcript is written there too).
 max_mb = 300
 min_free_mb = 1024
 jpeg_quality = 80

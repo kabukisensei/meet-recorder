@@ -868,6 +868,70 @@ class TestKeepRule(unittest.TestCase):
                   + [s.frame(0, lines=[(10, 24, 100, 29)]) for _ in range(10)])
         self.assertEqual(run_keeps(frames), [9.0, 48.0])
 
+    @staticmethod
+    def deck(s, trans_ticks=2, mode="text", ticks_per_slide=5):
+        """Operator's live test (/tmp/mr-slides.py): 6 slides x 15 s (5 ticks
+        at 3 s) over a moving strip in the bottom 20 %. A change spans
+        trans_ticks ticks: the first trans_ticks - 1 show a fade (blend of
+        old and new), so the SAME cells move on every transition tick (the
+        Codex model: 2 moving + 3 calm ticks per slide)."""
+        def slide(k):
+            if mode == "gradient":
+                return s.frame(k)
+            ind = (7 * k) % 20 * 2                  # indent changes per slide
+            gap = 8 + 4 * (k % 2)
+            lines = [(2 + ind, 4, 52 + ind, 9)] + [
+                (6 + ind, 14 + i * gap, 46 + ind + 5 * i, 18 + i * gap)
+                for i in range(3 + k % 2)]
+            return s.frame(0, lines=lines)
+        frames, strip_at = [], STRIP_Y * TW * 3
+        for k in range(6):
+            for j in range(ticks_per_slide):
+                f = slide(k)
+                if k and j < trans_ticks - 1:
+                    a = (j + 1) / trans_ticks            # fade progress
+                    old = slide(k - 1)[3]
+                    mix = bytes(int(o + (n - o) * a)
+                                for o, n in zip(old[:strip_at], f[3][:strip_at]))
+                    f = f[:3] + (mix + f[3][strip_at:],)
+                frames.append(f)
+        return frames
+
+    def assert_one_per_slide(self, times, label):
+        self.assertEqual(len(times), 6, (label, times))
+        for k, t in enumerate(times):               # each inside its slide
+            self.assertTrue(15 * k <= t < 15 * (k + 1), (label, times))
+
+    def test_operator_deck_keeps_every_slide(self):
+        # the live blocker: after the first keep, 2-tick transitions used to
+        # mask the whole slide for good -> 1 frame instead of 6
+        for mode in ("text", "gradient"):
+            for trans in (1, 2, 3):
+                self.assert_one_per_slide(
+                    run_keeps(self.deck(Screen(), trans, mode)), (mode, trans))
+
+    def test_share_starting_with_live_strip_is_masked_after_the_burst(self):
+        # a still window, then a share + live strip appear at once (a burst
+        # that includes the strip): the strip's first 2 ticks are exempt,
+        # then it is masked and the slide is kept, not suppressed forever
+        s = Screen()
+        frames = ([s.frame(5, strip="static") for _ in range(5)]
+                  + [s.frame(0) for _ in range(10)])
+        times = run_keeps(frames)
+        self.assertEqual(times[0], 6.0)
+        self.assertEqual(len(times), 2)
+        self.assertTrue(15 < times[1] <= 30, times)
+
+    def test_video_starting_after_a_still_picture_keeps_nothing_more(self):
+        s = Screen()
+        frames = ([s.frame(5, strip="static") for _ in range(5)]
+                  + [s.frame(0, video=True) for _ in range(30)])
+        self.assertEqual(run_keeps(frames), [6.0])
+
+    def test_constant_strip_alone_keeps_only_the_first_frame(self):
+        s = Screen()
+        self.assertEqual(run_keeps([s.frame(0) for _ in range(40)]), [9.0])
+
     def test_while_volatile_the_strip_is_ignored(self):
         s = Screen()
         frames = [s.frame(0) for _ in range(30)]
@@ -942,12 +1006,24 @@ class TestScreenHelpers(unittest.TestCase):
             self.assertEqual(mr.screen_params(cfg)["settle_ticks"], 2)
 
 
+@contextlib.contextmanager
+def collect_sandbox(d, cfg="[screens]\nmin_free_mb = 0\n"):
+    """(raw, out) for collect_screens: raw is a staging dir under a temp
+    CACHE_DIR, out a recording folder (meta.json); config is a temp file."""
+    cache, out = os.path.join(d, "cache"), os.path.join(d, "out")
+    os.makedirs(cache, exist_ok=True)
+    os.makedirs(out, exist_ok=True)
+    if not os.path.exists(os.path.join(out, "meta.json")):
+        Path(out, "meta.json").write_text("{}")
+    with mock.patch.object(mr, "CACHE_DIR", cache), \
+            mock.patch.object(mr, "CONFIG_FILE", make_cfg(d, cfg)):
+        yield os.path.join(cache, "1700000000-abcdef"), out
+
+
 class TestCollectScreens(unittest.TestCase):
     def test_moves_frames_and_skips_torn_or_missing(self):
-        with tempfile.TemporaryDirectory() as d:
-            raw, out = os.path.join(d, "raw"), os.path.join(d, "out")
+        with tempfile.TemporaryDirectory() as d, collect_sandbox(d) as (raw, out):
             os.makedirs(os.path.join(raw, "screens"))
-            os.makedirs(out)
             for name in ("00012.0s.jpg", "00003.0s.jpg"):
                 Path(raw, "screens", name).write_bytes(b"jpg")
             Path(raw, "screens.jsonl").write_text(
@@ -965,6 +1041,85 @@ class TestCollectScreens(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(mr.collect_screens(os.path.join(d, "nope"), d), 0)
             self.assertEqual(os.listdir(d), [])
+
+    def staged(self, raw, names=("00003.0s.jpg",)):
+        make_frames(raw, names)
+        Path(raw, "screens.jsonl").write_text("".join(
+            json.dumps({"t": float(n[:7]), "file": n}) + "\n" for n in names))
+
+    def test_unreadable_manifest_is_not_empty(self):
+        # Codex: a PermissionError reading screens.jsonl made the collector
+        # see "no frames" and rmtree the only copy
+        with tempfile.TemporaryDirectory() as d, collect_sandbox(d) as (raw, out), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.staged(raw)
+            real_open = open
+
+            def deny(path, *a, **k):
+                if str(path).endswith("screens.jsonl"):
+                    raise PermissionError(13, "denied")
+                return real_open(path, *a, **k)
+            with mock.patch("builtins.open", deny):
+                self.assertEqual(mr.collect_screens(raw, out), 0)
+            self.assertTrue(os.path.isfile(os.path.join(raw, "screens", "00003.0s.jpg")))
+            self.assertIn("denied", err.getvalue())
+            self.assertEqual(mr.collect_screens(raw, out), 1)      # retry works
+            self.assertFalse(os.path.exists(raw))
+
+    def test_swapped_or_foreign_paths_delete_nothing(self):
+        with tempfile.TemporaryDirectory() as d, collect_sandbox(d) as (raw, out), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.staged(raw)
+            make_frames(out, ["00001.0s.jpg"])        # a collected recording
+            Path(out, "screens.jsonl").write_text(     # even with a manifest
+                json.dumps({"t": 1.0, "file": "00001.0s.jpg"}) + "\n")
+            before = sorted(os.listdir(out))
+            self.assertEqual(mr.collect_screens(out, raw), 0)        # swapped
+            self.assertEqual(mr.cmd_collect_screens([out, raw]), 2)
+            other = os.path.join(d, "elsewhere")
+            self.staged(other)
+            self.assertEqual(mr.collect_screens(other, out), 0)      # not staging
+            self.assertEqual(sorted(os.listdir(out)), before)
+            self.assertTrue(os.path.isdir(other) and os.path.isdir(raw))
+            os.remove(os.path.join(out, "meta.json"))                # not a recording
+            self.assertEqual(mr.collect_screens(raw, out), 0)
+            self.assertTrue(os.path.isdir(raw))
+
+    def test_leftovers_keep_staging(self):
+        with tempfile.TemporaryDirectory() as d, collect_sandbox(d) as (raw, out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.staged(raw)
+            make_frames(raw, ["00009.0s.jpg"])          # frame not in manifest
+            Path(raw, "mic.wav").write_bytes(b"RIFF")    # WAV not removed
+            self.assertEqual(mr.collect_screens(raw, out), 1)
+            self.assertTrue(os.path.isfile(os.path.join(raw, "mic.wav")))
+            self.assertTrue(os.path.isfile(os.path.join(raw, "screens", "00009.0s.jpg")))
+
+    def test_staging_without_frames_is_removed(self):
+        # screens disabled / nothing kept: the WAVs are gone after the mix
+        with tempfile.TemporaryDirectory() as d, collect_sandbox(d) as (raw, out):
+            os.makedirs(raw)
+            Path(raw, "screens.log").write_text("no window\n")
+            self.assertEqual(mr.collect_screens(raw, out), 0)
+            self.assertFalse(os.path.exists(raw))
+            self.assertEqual(Path(out, "screens.log").read_text(), "no window\n")
+
+    def test_output_reserve_stops_copying_and_keeps_staging(self):
+        with tempfile.TemporaryDirectory() as d, \
+                collect_sandbox(d, "[screens]\nmin_free_mb = 1e12\n") as (raw, out), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.staged(raw)
+            self.assertEqual(mr.collect_screens(raw, out), 0)
+            self.assertIn("nearly full", err.getvalue())
+            self.assertTrue(os.path.isdir(raw))
+
+    def test_absurd_manifest_time_is_skipped_not_raised(self):
+        with tempfile.TemporaryDirectory() as d, collect_sandbox(d) as (raw, out):
+            make_frames(raw, ["00003.0s.jpg"])
+            Path(raw, "screens.jsonl").write_text(
+                '{"t": 1' + "0" * 400 + ', "file": "00003.0s.jpg"}\n')
+            self.assertEqual(mr.read_screens_jsonl(raw), [])
 
 
 class TestMoments(unittest.TestCase):
@@ -1148,11 +1303,33 @@ class TestProcessIdentity(StateDirMixin, unittest.TestCase):
         # a worker that ignores SIGTERM and has a child (think: grim)
         p, start = self.child("trap '' TERM; sleep 60 & wait", group=True)
         time.sleep(0.1)
-        self.assertTrue(mr.group_alive(p.pid))
+        self.assertEqual(len(mr.group_members((p.pid, start))), 2)
         t0 = time.monotonic()
         mr.stop_procs([], (p.pid, start), timeout=0.5)
         self.assertLess(time.monotonic() - t0, 3)
-        self.assertFalse(mr.group_alive(p.pid))
+        self.assertEqual(mr.group_members((p.pid, start)), [])
+
+    def test_dead_worker_still_has_its_grim_killed(self):
+        # Codex: the worker died first, its identity check failed and stop
+        # skipped the group, leaving grim running
+        pidfile = os.path.join(self.d, "grim.pid")
+        p, start = self.child(f"sleep 60 & echo $! > {pidfile}; exit 0", group=True)
+        p.wait()                                   # the worker is gone (reaped)
+        grim = int(Path(pidfile).read_text())
+        self.addCleanup(lambda: mr.pid_alive(grim) and os.kill(grim, 9))
+        self.assertTrue(mr.pid_alive(grim))
+        mr.stop_procs([], (p.pid, start), timeout=1)
+        deadline = time.time() + 3
+        while mr.pid_alive(grim) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(mr.pid_alive(grim))
+
+    def test_reused_group_leader_is_not_signalled(self):
+        # the worker's pid now leads someone else's group (other start time)
+        p, start = self.child(group=True)
+        self.assertEqual(mr.group_members((p.pid, start + 1)), [])
+        mr.stop_procs([], (p.pid, start + 1), timeout=0.3)
+        self.assertIsNone(p.poll())
 
     def test_stop_survives_signal_errors_and_still_finalizes(self):
         p, start = self.child()
@@ -1246,7 +1423,7 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
             with mr.lifecycle_lock(timeout=0.3):
                 pass
         with mock.patch.object(mr, "LOCK_TIMEOUT", 0.3):
-            self.assertEqual(mr.cmd_stop(), 1)        # reports busy, no crash
+            self.assertEqual(mr.cmd_stop(), mr.BUSY)  # reports busy, no crash
         self.assertIn("busy", self.err.getvalue())
         holder.kill()
         holder.stdout.close()
@@ -1298,6 +1475,132 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
         self.assertIsInstance(st["screens_pid"], int)
         self.assertEqual(mr.cmd_start(), 1)               # already recording
 
+    def lock_is_free(self):
+        code = ("import fcntl, os, sys\nfd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+                "try:\n    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "except BlockingIOError:\n    sys.exit(7)\n")
+        return subprocess.run([sys.executable, "-I", "-c", code,
+                               mr.LOCK_FILE]).returncode == 0
+
+    def test_watcher_never_stops_a_replacement_session(self):
+        # Codex: the watcher decided to stop Teams session A outside the
+        # lock; meanwhile a manual session B replaced it
+        p, start = self.child()
+        mr.write_state({"id": "B", "source": "manual", "pids": [p.pid],
+                        "pid_starts": {str(p.pid): start}})
+        with mock.patch.object(mr, "finish_session", side_effect=AssertionError):
+            self.assertEqual(mr.cmd_stop(expect_id="A", expect_source="teams"), 1)
+        self.assertEqual(mr.read_state()["id"], "B")
+        self.assertIsNone(p.poll())
+        mr.write_state({"id": "A", "source": "manual", "pids": [p.pid],
+                        "pid_starts": {str(p.pid): start}})
+        with mock.patch.object(mr, "finish_session", side_effect=AssertionError):
+            self.assertEqual(mr.cmd_stop(expect_id="A", expect_source="teams"), 1)
+        self.assertIsNone(p.poll())                    # same id, other source
+
+    def test_stop_and_toggle_mix_with_the_lock_released(self):
+        for cmd in (mr.cmd_stop, mr.cmd_toggle):
+            p, start = self.child()
+            mr.write_state({"id": "x", "pids": [p.pid],
+                            "pid_starts": {str(p.pid): start}})
+            seen = []
+            with mock.patch.object(mr, "finish_session",
+                                   lambda st, cfg, **kw: seen.append(
+                                       self.lock_is_free()) or 0):
+                self.assertEqual(cmd(), 0)
+            self.assertEqual(seen, [True], cmd.__name__)
+
+    def test_recovery_mixes_with_the_lock_released(self):
+        rec, rstart = self.child("exit 0")
+        rec.wait()
+        mr.write_state({"id": "dead", "pids": [rec.pid],
+                        "pid_starts": {str(rec.pid): rstart}})
+        seen = []
+        with mock.patch.object(mr, "finish_session",
+                               lambda st, cfg, **kw: seen.append(self.lock_is_free())):
+            mr.recover_if_stale()
+        self.assertEqual(seen, [True])
+
+    def start_env(self, spawn=None, cfg_body=None):
+        """Patches for cmd_start: fake pw-record (sleep) and pactl; returns
+        the list of spawned recorder Popens."""
+        real_popen = subprocess.Popen
+        mr.CACHE_DIR, saved_cache = os.path.join(self.d, "cache"), mr.CACHE_DIR
+        self.addCleanup(setattr, mr, "CACHE_DIR", saved_cache)
+        if cfg_body is not None:
+            Path(mr.CONFIG_FILE).write_text(cfg_body)
+        spawned = []
+
+        def fake_popen(argv, **kw):
+            if argv[0] == "pw-record":
+                p = real_popen(["sleep", "60"], **kw)
+                self.children.append(p)
+                spawned.append(p)
+                return p
+            return real_popen(argv, **kw)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(mr.subprocess, "Popen", fake_popen))
+        stack.enter_context(mock.patch.object(mr.subprocess, "check_output",
+                                              lambda *a, **k: "default\n"))
+        stack.enter_context(mock.patch.object(mr, "run_json", lambda *a, **k: []))
+        stack.enter_context(mock.patch.object(mr, "notify", lambda *a: None))
+        if spawn is not None:
+            stack.enter_context(mock.patch.object(mr, "spawn_screens", spawn))
+        self.addCleanup(stack.close)
+        return spawned
+
+    def test_bad_config_fails_start_before_any_spawn(self):
+        spawned = self.start_env(cfg_body="[audio]\nsample_rate = lots\n")
+        self.assertEqual(mr.cmd_start(), 1)
+        self.assertEqual((spawned, mr.read_state()), ([], None))
+
+    def test_malformed_screens_enabled_does_not_strand_recorders(self):
+        # Codex: `[screens] enabled = %` raised after both recorders spawned
+        spawned = self.start_env(spawn=lambda *a: None,
+                                 cfg_body="[screens]\nenabled = %\n")
+        self.assertEqual(mr.cmd_start(), 0)
+        self.assertEqual(len(spawned), 2)
+        self.assertTrue(mr.session_live(mr.read_state()))
+
+    def test_failure_after_spawning_leaves_no_orphan(self):
+        for exc in (RuntimeError("boom"), KeyboardInterrupt()):
+            def bad_spawn(*a, exc=exc):
+                raise exc
+            spawned = self.start_env(spawn=bad_spawn)
+            if isinstance(exc, KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    mr.cmd_start()
+            else:
+                self.assertEqual(mr.cmd_start(), 1)
+            self.assertEqual(len(spawned), 2)
+            for p in spawned:
+                self.assertIsNotNone(p.wait(timeout=3))
+            self.assertIsNone(mr.read_state())
+            self.assertEqual(os.listdir(mr.CACHE_DIR), [])
+            self.assertTrue(self.lock_is_free())
+
+    def test_watcher_retries_a_busy_start(self):
+        Path(mr.CONFIG_FILE).write_text(
+            "[auto]\nstart_after_seconds = 0\npoll_seconds = 0.5\n")
+        rcs, ticks = [mr.BUSY, 0], []
+
+        def fake_start(**kw):
+            return rcs.pop(0) if rcs else 0
+
+        class Done(Exception):
+            pass
+
+        def fake_sleep(s):
+            ticks.append(s)
+            if len(ticks) >= 3:
+                raise Done
+        with mock.patch.object(mr, "call_active", lambda cfg: True), \
+                mock.patch.object(mr, "cmd_start", side_effect=fake_start) as start, \
+                mock.patch.object(mr.time, "sleep", fake_sleep):
+            with self.assertRaises(Done):
+                mr.cmd_watch()
+        self.assertEqual(start.call_count, 2)          # busy -> tried again
+
     def test_auto_toggle_writes_only_its_key(self):
         self.assertEqual(mr.cmd_auto(["off"]), 0)
         text = Path(mr.CONFIG_FILE).read_text()
@@ -1331,7 +1634,17 @@ class TestDiskAndPrivacy(unittest.TestCase):
             self.assertEqual(Path(path).read_text(), '{"a": 1}\n')
 
     def raw_session(self, d, names):
-        raw = os.path.join(d, "raw")
+        """A staging dir under a temp CACHE_DIR + a recording folder d/out
+        (meta.json), as collect_screens requires; config from a temp file."""
+        cache = os.path.join(d, "cache")
+        self.enterContext(mock.patch.object(mr, "CACHE_DIR", cache))
+        self.enterContext(mock.patch.object(
+            mr, "CONFIG_FILE", make_cfg(d, "[screens]\nmin_free_mb = 0\n")))
+        out = os.path.join(d, "out")
+        os.makedirs(out, exist_ok=True)
+        if not os.path.exists(os.path.join(out, "meta.json")):
+            Path(out, "meta.json").write_text("{}")
+        raw = os.path.join(cache, "1700000000-abcdef")
         make_frames(raw, names)
         Path(raw, "screens.jsonl").write_text("".join(
             json.dumps({"t": float(n[:7]), "file": n, "window_title": "W"}) + "\n"
@@ -1342,7 +1655,7 @@ class TestDiskAndPrivacy(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             raw = self.raw_session(d, ["00003.0s.jpg", "00012.0s.jpg"])
             out = os.path.join(d, "out")
-            os.mkdir(out)
+            os.makedirs(out, exist_ok=True)
             Path(out, "meta.json").write_text(json.dumps(
                 {"transcript_status": "done", "speaker_labels": True}))
             old = os.umask(0)
@@ -1365,7 +1678,7 @@ class TestDiskAndPrivacy(unittest.TestCase):
             raw = self.raw_session(d, ["00003.0s.jpg", "00012.0s.jpg"])
             os.chmod(os.path.join(raw, "screens", "00012.0s.jpg"), 0)
             out = os.path.join(d, "out")
-            os.mkdir(out)
+            os.makedirs(out, exist_ok=True)
             if os.access(os.path.join(raw, "screens", "00012.0s.jpg"), os.R_OK):
                 self.skipTest("running as root")
             self.assertEqual(mr.collect_screens(raw, out), 1)
@@ -1379,7 +1692,7 @@ class TestDiskAndPrivacy(unittest.TestCase):
     def test_moments_built_by_whichever_finishes_last(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "out")
-            os.mkdir(out)
+            os.makedirs(out, exist_ok=True)
             # transcription finished first: no frames yet -> no moments
             Path(out, "segments.json").write_text(json.dumps([seg(10, 12, "hello")]))
             Path(out, "transcript.md").write_text("# M\n\n[00:10 -> 00:12] hello\n")
@@ -1392,7 +1705,7 @@ class TestDiskAndPrivacy(unittest.TestCase):
     def test_collect_before_transcript_skips_moments(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "out")
-            os.mkdir(out)
+            os.makedirs(out, exist_ok=True)
             mr.collect_screens(self.raw_session(d, ["00012.0s.jpg"]), out)
             self.assertFalse(os.path.exists(os.path.join(out, "moments.md")))
 

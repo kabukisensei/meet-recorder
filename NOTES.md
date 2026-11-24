@@ -156,9 +156,28 @@ with faster-whisper. Zero network/cloud use at runtime.
   missing window or a different stableId resets the history (no stale diff).
   Why 2 (not the 3 first tried): live, a random strip cell sometimes holds
   still for one tick; 3-of-5 then took ~15 s to warm up and missed a first
-  slide shown for 15 s (measured). A slide change moves its cells on one
-  tick, so it is never masked; one caught on 2 consecutive ticks (slow build
-  animation) is masked and kept ≤ 5 ticks later instead.
+  slide shown for 15 s (measured).
+- **Transitions are not video** (fix round 4, Codex): a slide change caught
+  on 2 ticks (a fade, a half-drawn repaint) moved the same cells twice →
+  masked; with a slide every 15 s (2 moving + 3 still ticks) the 5-still
+  release never came and every later slide was lost. Now a tick on which ≥
+  `burst_fraction` (10 %) of all cells *start* moving (calm, and still for
+  the previous `SCREEN_BURST_QUIET` = 2 ticks) is a burst: those cells' moves
+  on it and on their next `transition_ticks - 1` (1) ticks are not
+  volatility evidence. Video moves continuously, so it still masks (a share
+  that starts together with a live strip is masked ~2 ticks later). Why
+  "still for 2 ticks": a strip cell pausing for one tick then moving again
+  is not an onset (that broke warm-up when "previous tick" alone was used).
+  The first tick after a reset is never a burst, so warm-up is unchanged.
+  Up to 3-tick transitions keep every slide (tested); a small change
+  (< 10 % of cells) seen on 2 ticks is still masked and kept ≤ 5 ticks later.
+- **The operator's live "1 frame at 9.5 s" was the test window**:
+  `/tmp/mr-slides.py` does `rows, cols = os.get_terminal_size()`, but that
+  is `(columns, lines)`, so it wrote ~67 lines of 30 chars into a 30-line
+  terminal and every redraw scrolled the slide off the top; only the strip
+  was ever on screen (verified from the captured thumbnails). With that one
+  line fixed (and started 1 s after foot, so Hyprland's tiling has settled
+  the size), the real loop keeps one frame per slide.
   Consequences: a slide with a live strip is kept ~2 ticks after the strip
   turns volatile (first slide ~9 s in) or after the slide changes (~6 s);
   a camera-only call with static Teams chrome (< 85 % video) keeps one frame
@@ -176,10 +195,21 @@ with faster-whisper. Zero network/cloud use at runtime.
   core (see the commit's live proof).
 - `finalize_audio` only mixes audio and deletes the WAVs; `stop` then spawns
   `transcribe` AND a separate detached `collect-screens <raw> <folder>` job,
-  so slow storage never delays the audio or the transcription. The collector
-  copies each frame (verified size, 0600), publishes `screens.json` listing
-  exactly the verified copies, merges `"screens": N` into meta.json, and
-  deletes the raw dir only if every copy succeeded (otherwise re-run it).
+  so slow storage never delays the audio or the transcription.
+  `finalize_audio` never reads screen data (a bad manifest once could fail
+  it after the WAVs were deleted); a collector spawn error is logged only.
+  The collector copies each frame (0600, read back and compared), publishes
+  `screens.json` listing exactly the verified copies, merges `"screens": N`
+  into meta.json. It refuses paths that are not <staging dir directly under
+  `~/.cache/meet-recorder`, no meta.json> → <recording folder with meta.json,
+  outside the cache> (`collect_paths_error`; swapped arguments delete
+  nothing, the CLI exits 2). An unreadable manifest is an error, not "no
+  frames". It stops copying before the output disk drops below
+  `min_free_mb`. The raw dir is deleted only if all of that went fine, every
+  `NNNNN.Ns.jpg` in it was copied, and it holds nothing but `screens/`,
+  `screens.jsonl`, `screens.log` (a leftover WAV keeps it); otherwise re-run
+  `meet-recorder collect-screens <raw> <folder>`. The collector also
+  removes frame-less raw dirs (screens off) since finalize no longer does.
   meta.json is merged under a folder flock (`update_meta`) by both jobs;
   transcript.md/.txt are now written atomically.
 - `moments.md` (frame image + the segments overlapping [t-30 s, t+15 s]) is
@@ -206,8 +236,29 @@ with faster-whisper. Zero network/cloud use at runtime.
   pidfd after the identity check. Signalling errors are printed, never
   raised, so finalization always runs.
 - `stop_procs`: recorders SIGINT, worker group SIGTERM, wait 5 s, SIGKILL
-  survivors (group included). The watcher reaps its children every poll and
-  recovers a session whose recorders died as soon as it notices.
+  survivors. The worker group is handled member by member
+  (`group_members`: pgid == worker pid, our uid, started no earlier than the
+  worker; nothing if the worker's pid now leads another group), each
+  signalled by identity, so a grim left behind by a dead worker is still
+  killed and a reaped leader's bare pgid is never signalled. The watcher
+  reaps its children every poll and recovers a session whose recorders
+  died as soon as it notices.
+- Lock scope (fix round 4): audio mixing never runs under the lock. `stop`,
+  `toggle` and stale recovery stop + clear under it and call
+  `finish_session` after releasing it (a crashed session found by `start`
+  is mixed after the new recording started). Commands run under it are
+  bounded (`pactl get-default-*` 5 s, `run_json` 5 s, `notify-send` 5 s).
+  Busy = exit 75 (`BUSY`); the watcher retries a busy start/stop next poll
+  instead of marking the call handled.
+- The watcher stops by identity: `cmd_stop(expect_id=…, expect_source=
+  "teams")` re-checks both under the lock and stops nothing if a manual
+  recording replaced its Teams one in the meantime.
+- Start resolves every setting (`start_settings`: sample rate, apps,
+  `[screens] enabled`, which tolerates `enabled = %`) and probes the
+  devices before spawning; from the first spawn to the published state is
+  one try block: any exception (incl. KeyboardInterrupt) stops what was
+  spawned and removes the raw dir. (A SIGKILL mid-start can still strand
+  recorders; out of scope.)
 - `meet-recorder auto on|off` rewrites only `[auto] enabled` in config.ini
   (it used to freeze every default into the file).
 - `meet-recorder latest` prints the newest folder with a transcript.md under
