@@ -9,6 +9,7 @@ import qs.Ui
 // Meeting recorder: an always-visible mic icon in the bar.
 //   dim mic            idle
 //   red dot + MM:SS    recording
+//   ... + camera N     for ~2 s after a manual snap landed (N = snaps so far)
 //   accent mic + "…"   transcribing the last recording
 // Left click opens the panel (start/stop, auto-record toggle, open files).
 // Middle or right click toggles recording directly.
@@ -30,6 +31,8 @@ Panel {
   property string lastStatus: ""
   property string outputDir: Quickshell.env("HOME") + "/Recordings"
   property bool busy: false
+  property int snaps: -1               // manual snaps this session (-1 = unknown)
+  property bool snapFlash: false
 
   readonly property bool recording: phase === "recording"
   readonly property bool transcribing: phase === "transcribing"
@@ -86,6 +89,13 @@ Panel {
         try {
           var s = JSON.parse(text)
           root.phase = String(s.state || "idle")
+          var n = Number(s.snaps) || 0
+          // a new manual snap since the last poll: flash the camera
+          if (root.phase === "recording" && root.snaps >= 0 && n > root.snaps) {
+            root.snapFlash = true
+            flashTimer.restart()
+          }
+          root.snaps = root.phase === "recording" ? n : -1
           root.elapsed = Number(s.elapsed) || 0
           root.source = String(s.source || "")
           root.title = String(s.title || "")
@@ -109,6 +119,13 @@ Panel {
   }
 
   Process { id: opener; running: false }
+
+  Timer {
+    id: flashTimer
+    interval: 2000
+    repeat: false
+    onTriggered: root.snapFlash = false
+  }
 
   Timer {
     interval: root.recording || root.opened ? 1000 : 3000
@@ -136,6 +153,7 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: root.recording ? "\u{f044a} " + root.clock(root.elapsed)
+        + (root.snapFlash ? "  \u{f0100} " + root.snaps : "")
       : root.transcribing ? "\u{f036c} …" : "\u{f036c}"
     fontSize: Style.bar.iconFont
     fixedWidth: -1

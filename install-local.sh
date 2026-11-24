@@ -25,6 +25,10 @@ install -m 644 RECORDINGS.md ~/Recordings/README.md
 # nothing is restarted, the running daemon is untouched).
 rm -f ~/.config/pipewire/pipewire.conf.d/50-meet-recorder-aec.conf
 
+# Manual snap hotkey (SUPER+ALT+R, else SUPER+SHIFT+U), added once next to
+# the recorder toggle; reverted on Hyprland config errors.
+./install-hypr-bind.sh || echo "warning: snap hotkey step failed" >&2
+
 systemctl --user daemon-reload
 systemctl --user enable meet-recorder-watch.service
 systemctl --user restart meet-recorder-watch.service

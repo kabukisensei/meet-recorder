@@ -15,6 +15,7 @@ uninstall:
 compile:
 	python3 -m py_compile $(CLI) tests/test_pure.py
 	bash -n meet-recorder-summarize
+	bash -n install-hypr-bind.sh
 
 test:
 	python3 -m unittest discover -s tests -v

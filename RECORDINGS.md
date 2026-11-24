@@ -28,9 +28,11 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
         │                               was chosen (when echo cancellation ran)
         ├── screens/                    JPEGs of the Teams window, one per screen change
         │                               (e.g. a new slide), named by offset: 00123.4s.jpg
-        ├── screens.json                [{"t": seconds, "file", "window_title", "w", "h"}]
+        ├── screens.json                [{"t": seconds, "file", "window_title", "w", "h"}],
+        │                               plus "manual": true for frames you snapped
         ├── moments.md                  one section per frame: image + what was said
-        │                               from 30 s before to 15 s after it
+        │                               from 30 s before to 15 s after it; snapped
+        │                               frames say "📌 marked by you"
         ├── summary.md                  AI summary (if configured); action items and
         │                               decisions end in [mm:ss] and link the screen
         │                               that was showing then
@@ -109,6 +111,9 @@ the audio.
   `meet-recorder auto on|off`.
 - Manual control: click the mic icon in the top bar, press Super+Shift+R, or
   run `meet-recorder start|stop|toggle|status`.
+- Save the call window right now: Super+Alt+R (`meet-recorder snap`). A
+  "Screen saved" notification with the picture confirms it, and the bar
+  briefly shows a camera and the snap count.
 - Transcription runs locally (faster-whisper) after the recording stops and
   takes roughly 5% of the meeting length. Nothing is uploaded.
 - Settings: `~/.config/meet-recorder/config.ini`. Source and notes: `~/meet-recorder/`.

@@ -174,3 +174,18 @@ with `[mm:ss]` and links the matching frame (`link-screens`). Images never
 leave the machine; only transcript text goes to the summarizer. Configure in
 `[screens]` (see `config.ini.example`); `enabled = false` turns it off.
 Commands: `moments <folder>...`, `link-screens <folder>...`.
+
+### Manual snap (hotkey)
+
+Press **Super+Alt+R** during a recording to save the Teams call window right
+now, whatever the automatic rule thinks (`meet-recorder snap`; `snap --window
+focused` saves the active window instead). Within half a second you get a
+"Screen saved" notification showing the captured image and `mm:ss · <window
+title>`, and the bar shows a camera with the number of snaps next to the red
+timer for ~2 s. If nothing could be saved (not recording, no Teams window,
+disk/budget limits) you get a critical "Screen NOT saved — <reason>"
+notification instead. Snapped frames are marked "📌 marked by you" in
+`moments.md` and preferred by `link-screens`. `install-local.sh` adds the
+binding to `~/.config/hypr/bindings.lua` once, next to the Super+Shift+R
+toggle (`install-hypr-bind.sh`; falls back to Super+Shift+U if Super+Alt+R is
+taken, and reverts itself if Hyprland reports config errors).

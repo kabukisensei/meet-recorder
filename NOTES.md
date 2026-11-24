@@ -17,6 +17,7 @@ with faster-whisper. Zero network/cloud use at runtime.
   (auto-records Teams calls; enabled under graphical-session.target)
 - `RECORDINGS.md` — installed as `~/Recordings/README.md`; documents the output layout
 - `install-local.sh` — syncs this repo to the installed locations
+- `install-hypr-bind.sh` — adds the Super+Alt+R snap binding (idempotent)
 
 ## Hard rules
 
@@ -518,3 +519,39 @@ against a real mic. Until then `mic_source = raw`.
 - The shell-out probe for the bar widget uses `sed`/`date` in `sh`, not QML
   JS math (QML `Date.now()` bindings proved unreliable in this shell).
 - `SUPER+SHIFT+R` is the user-facing toggle (wired in `~/.config/hypr/bindings.lua`).
+- `SUPER+ALT+R` = `meet-recorder snap` (Task 9, below). Verified free on
+  2026-11-24 with `hyprctl binds -j` (modmask 72 + R unused; SUPER+CTRL(+ALT/
+  SHIFT)+R are the reminder binds).
+
+## Manual snap (Task 9, 2026-11-24)
+
+- `meet-recorder snap [--window focused]` (`cmd_snap` / `take_snap`): if
+  session.json is live, picks the window like screens-loop
+  (`pick_screen_window`, `[screens] window_class`) or the active one
+  (`hyprctl activewindow -j`, stableId looked up in `clients` if absent),
+  grabs a full-res JPEG via `grab_frame` (grim -T, stdout), writes it 0600
+  into `<raw>/screens/` (0700) under a free `NNNNN.Ns.jpg` name (moved on
+  by 0.1 s if taken, so it never replaces an automatic frame) and appends
+  `{"t","file","window_title","w","h","manual": true}` to screens.jsonl
+  (one O_APPEND write, like the loop). Bypasses the keep rule, min_gap,
+  min_width and settling; respects max_mb / min_free_mb
+  (`frame_budget_error`). Not live -> exit 1.
+- Visual signal: `notify_snap` -> `notify-send -a "Meeting snap" -c
+  meet-recorder.snap -t 2500 -i <jpg> -h string:image-path:<jpg> "Screen
+  saved" "mm:ss · <title>"`; failure: `-u critical -t 6000 "Screen NOT
+  saved — <reason>"`. Mako can style it by app-name/category.
+- `status --json` gains `snaps` / `last_snap_unix` (`session_snaps`: manual
+  entries in the live manifest; unix = start + t). Panel.qml flashes
+  `● MM:SS  <camera> N` for 2 s when `snaps` rises between polls (1 s while
+  recording); -1 = unknown after a shell restart, so no false flash.
+- Downstream: the collector copies entries verbatim (screens.json keeps
+  `manual`); `render_moments` appends "📌 marked by you"; `pick_frame`
+  prefers a manual frame anywhere in [t-90 s, t+15 s] (same latest-before /
+  earliest-after rule among the manual ones).
+- Hotkey: `install-hypr-bind.sh` (called by install-local.sh) inserts
+  `o.bind("SUPER + ALT + R", "Meeting snap", "meet-recorder snap")` right
+  after the toggle line only if no `meet-recorder snap` binding exists;
+  SUPER+SHIFT+U if `hyprctl binds -j` shows modmask 72/R taken (65/U too ->
+  warn, nothing added). `hyprctl reload` only after a change; non-blank
+  `hyprctl configerrors` (clean output is just newlines) -> restore the
+  backup, reload, warn. `HYPRCTL=` overrides for tests.

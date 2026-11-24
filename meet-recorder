@@ -1068,7 +1068,8 @@ def render_moments(frames, segments):
     out = ["# Screen moments", ""]
     for f in sorted(frames, key=lambda f: f["t"]):
         title = " ".join(str(f.get("window_title") or "Screen").split())
-        out += [f"## {fmt_ts(f['t'])} — {title}", "",
+        mark = " — 📌 marked by you" if f.get("manual") is True else ""
+        out += [f"## {fmt_ts(f['t'])} — {title}{mark}", "",
                 f"![screen {fmt_ts(f['t'])}](screens/{f['file']})", ""]
         lines = [format_segment(d["start"], d["end"], " ".join(
             d["text"].split()), d.get("speaker", ""))
@@ -1089,7 +1090,13 @@ _SCREEN_LINK = re.compile(r" — \[screen \d+:\d\d\]\(screens/[0-9]+\.[0-9]s\.jp
 
 def pick_frame(frames, t, before=90.0, after=15.0):
     """Frame for a summary timestamp: the latest one in [t - before, t],
-    else the earliest in (t, t + after]; None if neither exists."""
+    else the earliest in (t, t + after]; None if neither exists. A frame
+    the user marked (snap, "manual": true) anywhere in that window wins
+    over automatic ones (same rule among the manual frames)."""
+    manual = [f for f in frames if f.get("manual") is True
+              and t - before <= f["t"] <= t + after]
+    if manual and len(manual) < len(frames):
+        return pick_frame(manual, t, before, after)
     earlier = [f for f in frames if t - before <= f["t"] <= t]
     if earlier:
         return max(earlier, key=lambda f: f["t"])
@@ -1875,7 +1882,8 @@ def start_locked(cfg, source, stale=None):
     notify("● Recording started",
            (title or ("Teams call" if source == "teams" else "Manual recording"))
            + (f"\n⚠ {state['start_note']}" if lost else "")
-           + "\nStop: click the mic icon in the bar, or Super+Shift+R")
+           + "\nStop: click the mic icon in the bar, or Super+Shift+R"
+           + "\nSave the screen now: Super+Alt+R")
     print("recording")
     return 0
 
@@ -3017,6 +3025,162 @@ def cmd_screens_loop(args=()):
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Manual snap (Task 9): `meet-recorder snap [--window focused]`
+# --------------------------------------------------------------------------- #
+
+SNAP_APP = "Meeting snap"              # notify-send app name (mako styling)
+SNAP_CATEGORY = "meet-recorder.snap"   # notify-send category
+
+
+def notify_snap(ok, title, body, image=None):
+    """The visual confirmation of a snap: a short notification with the
+    saved frame as its image, or a critical one when nothing was saved."""
+    argv = ["notify-send", "-a", SNAP_APP, "-c", SNAP_CATEGORY,
+            "-t", "2500" if ok else "6000"]
+    if image:
+        argv += ["-i", image, "-h", f"string:image-path:{image}"]
+    if not ok:
+        argv += ["-u", "critical"]
+    try:
+        subprocess.run(argv + [title, body], check=False, timeout=5,
+                       stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def snap_window(runner, which, window_class):
+    """The client to capture: the call window (the same choice as
+    screens-loop) or, with which == 'focused', the active window."""
+    clients = json.loads(runner.run(["hyprctl", "clients", "-j"], timeout=5))
+    if which != "focused":
+        win = pick_screen_window(clients, window_class)
+        if win is None:
+            raise RuntimeError(f"no {window_class or 'call'} window found")
+        return win
+    active = json.loads(runner.run(["hyprctl", "activewindow", "-j"],
+                                   timeout=5) or b"{}")
+    if not isinstance(active, dict) or not active.get("address"):
+        raise RuntimeError("no focused window")
+    if not active.get("stableId"):          # older hyprctl: look it up
+        active = next((c for c in clients or []
+                       if c.get("address") == active["address"]), active)
+    if not active.get("stableId"):
+        raise RuntimeError("focused window has no stableId")
+    return active
+
+
+def free_frame_name(shots, t):
+    """screen_file_name(t), moved on by 0.1 s while that name is taken, so
+    a manual frame never replaces (or is replaced by) another frame."""
+    for _ in range(1000):
+        name = screen_file_name(t)
+        if not os.path.exists(os.path.join(shots, name)):
+            return name, t
+        t += 0.1
+    raise RuntimeError("no free frame name")
+
+
+def dir_bytes(path):
+    total = 0
+    try:
+        for e in os.scandir(path):
+            if e.is_file(follow_symlinks=False):
+                total += e.stat().st_size
+    except OSError:
+        pass
+    return total
+
+
+def session_snaps(state):
+    """(manual snaps this session, unix time of the last one or 0) from
+    the live session's frame manifest."""
+    raw = (state or {}).get("session_dir") or ""
+    try:
+        frames = read_screens_jsonl(raw) if raw else []
+    except OSError:
+        return 0, 0
+    manual = [f for f in frames if f.get("manual") is True]
+    if not manual:
+        return 0, 0
+    return len(manual), int((state.get("start") or 0) + manual[-1]["t"])
+
+
+def take_snap(state, which, p, runner):
+    """Capture one window at full resolution into the session's staging
+    dir (0700 / 0600) and append its manifest line with "manual": true.
+    Bypasses the keep rule, min_gap and settling; respects max_mb and
+    min_free_mb. Returns (path, entry). Raises on any failure."""
+    raw = state.get("session_dir") or ""
+    if not os.path.isdir(raw):
+        raise RuntimeError("the recording has no staging dir")
+    win = snap_window(runner, which, p["window_class"])
+    t = max(0.0, time.monotonic() - float(state.get("origin") or 0.0))
+    shots = os.path.join(raw, "screens")
+    make_private_dir(shots)
+    st = os.statvfs(raw)
+    free, used = st.f_bavail * st.f_frsize, dir_bytes(shots)
+    data = grab_frame(runner, str(win["stableId"]), p["jpeg_quality"])
+    why = frame_budget_error(used, free, len(data), p)
+    if why:
+        raise RuntimeError(why)
+    name, t = free_frame_name(shots, round(t, 1))
+    path = os.path.join(shots, name)
+    w, h = jpeg_size(data[:65536])
+    entry = {"t": round(t, 1), "file": name,
+             "window_title": clean_window_title(win.get("title", "")),
+             "w": w, "h": h, "manual": True}
+    write_bytes_atomic(path, data, private=True)
+    try:
+        append_private(os.path.join(raw, "screens.jsonl"),
+                       json.dumps(entry) + "\n")
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    return path, entry
+
+
+def cmd_snap(args=()):
+    """snap [--window focused] -- save the call window (or the focused
+    one) now, as a manual screen moment, and confirm it visibly."""
+    which = "call"
+    it = iter(args)
+    for a in it:
+        if a == "--window":
+            which = next(it, "")
+        elif a.startswith("--window="):
+            which = a.split("=", 1)[1]
+        else:
+            which = None
+        if which not in ("call", "focused"):
+            print("usage: meet-recorder snap [--window focused|call]",
+                  file=sys.stderr)
+            return 2
+    state = read_state()
+    if not session_live(state):
+        notify_snap(False, "Screen NOT saved — not recording",
+                    "Start a recording first (Super+Shift+R).")
+        print("not recording", file=sys.stderr)
+        return 1
+    try:
+        path, entry = take_snap(state, which,
+                                screen_params(load_config()),
+                                CaptureRunner(hypr_env()))
+    except Exception as e:
+        notify_snap(False, f"Screen NOT saved — {e}",
+                    state.get("title") or "")
+        print(f"snap failed: {e}", file=sys.stderr)
+        return 1
+    notify_snap(True, "Screen saved",
+                f"{fmt_ts(entry['t'])} · {entry['window_title'] or 'Screen'}",
+                image=path)
+    print(path)
+    return 0
+
+
 def cmd_collect_screens(args=()):
     """Hidden: copy a finished session's frames into its folder (spawned by
     stop / recovery; safe to re-run). args: <raw-dir> <session-folder>."""
@@ -3167,7 +3331,9 @@ def status_dict():
     watching = (pid_alive(watch.get("pid", -1))
                 and time.time() - watch.get("beat", 0) < 30)
     last = read_json(LAST_FILE) or {}
+    snaps, last_snap = session_snaps(state) if live else (0, 0)
     return {
+        "snaps": snaps, "last_snap_unix": last_snap,
         "state": "recording" if live else ("transcribing" if jobs else "idle"),
         "elapsed": int(time.time() - state["start"]) if live else 0,
         "source": state.get("source", "manual") if live else "",
@@ -3436,7 +3602,7 @@ COMMANDS = {"start": cmd_start, "stop": cmd_stop, "toggle": cmd_toggle,
             "moments": cmd_moments, "link-screens": cmd_link_screens,
             "screens-loop": cmd_screens_loop,
             "collect-screens": cmd_collect_screens, "latest": cmd_latest,
-            "prune": cmd_prune}
+            "prune": cmd_prune, "snap": cmd_snap}
 
 
 def main(argv=None):
@@ -3445,7 +3611,7 @@ def main(argv=None):
         print("usage: meet-recorder start|stop|toggle|status [--json]|"
               "auto on|off|toggle|watch|transcribe <folder>|"
               "export <folder>...|moments <folder>...|"
-              "link-screens <folder>...|"
+              "link-screens <folder>...|snap [--window focused]|"
               "prune [--days N] [--apply]", file=sys.stderr)
         return 2
     return COMMANDS[argv[0]](argv[1:])

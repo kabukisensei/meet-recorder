@@ -3013,6 +3013,280 @@ class TestScreensWorkerProcess(unittest.TestCase):
         self.assertTrue(self.wait_for(lambda: w.poll() is not None, timeout=8))
 
 
+class TestSnap(unittest.TestCase):
+    """Task 9: `meet-recorder snap` against fake hyprctl / grim /
+    notify-send on PATH (real CLI process, temp HOME)."""
+    # minimal JPEG: SOI + SOF0 (512 high x 768 wide) + EOI
+    JPEG = r"\377\330\377\300\000\021\010\002\000\003\000\003\001\042\000\377\331"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = self._tmp.name
+        self.bin = os.path.join(self.d, "bin")
+        os.mkdir(self.bin)
+        self.notes = os.path.join(self.d, "notes.log")
+        self.script("hyprctl", """case "$1" in
+  clients) echo '[{"class": "teams-for-linux", "title": "Weekly sync | Microsoft Teams", "mapped": true, "stableId": "call1", "size": [1783, 1378], "address": "0x1"}, {"class": "foot", "title": "notes", "mapped": true, "stableId": "foot1", "size": [800, 600], "address": "0x2"}]';;
+  activewindow) echo '{"class": "foot", "title": "notes", "address": "0x2", "size": [800, 600]}';;
+esac""")
+        self.script("grim", f"echo \"$@\" >> {self.d}/grim.log; printf '{self.JPEG}'")
+        self.script("notify-send",
+                    f"for a in \"$@\"; do printf '%s\\n' \"$a\"; done >> {self.notes}; "
+                    f"echo --- >> {self.notes}")
+        self.cfg = make_cfg(self.d, "[screens]\nmax_mb = 300\nmin_free_mb = 0\n")
+        self.state_dir = os.path.join(self.d, ".local", "state", "meet-recorder")
+        os.makedirs(self.state_dir)
+        self.raw = os.path.join(self.d, "raw")
+        os.mkdir(self.raw, 0o700)
+        self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            p.kill()
+            p.wait()
+        self._tmp.cleanup()
+
+    def script(self, name, body):
+        path = os.path.join(self.bin, name)
+        Path(path).write_text("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+
+    def record(self, ago=65.0):
+        rec = subprocess.Popen(["sleep", "60"])
+        self.procs.append(rec)
+        time.sleep(0.05)
+        Path(self.state_dir, "session.json").write_text(json.dumps({
+            "id": "sid1", "session_dir": self.raw, "pids": [rec.pid],
+            "pid_starts": {str(rec.pid): mr.proc_start(rec.pid)},
+            "start": int(time.time() - ago), "origin": time.monotonic() - ago,
+            "title": "Weekly sync"}))
+
+    def cli(self, *args):
+        env = dict(os.environ, HOME=self.d, MEET_RECORDER_CONFIG=self.cfg,
+                   PATH=self.bin + ":/usr/bin:/bin")
+        return subprocess.run([sys.executable, CLI_PATH, *args], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+    def notifications(self):
+        try:
+            text = Path(self.notes).read_text()
+        except FileNotFoundError:
+            return []
+        return [n.strip("\n").split("\n") for n in text.split("---\n") if n.strip()]
+
+    def manifest(self):
+        return [json.loads(l) for l in
+                Path(self.raw, "screens.jsonl").read_text().splitlines()]
+
+    def test_snap_while_recording_saves_frame_manifest_and_count(self):
+        self.record()
+        t0 = time.monotonic()
+        r = self.cli("snap")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(time.monotonic() - t0, 5)
+        path = r.stdout.strip()
+        self.assertEqual(os.path.dirname(path), os.path.join(self.raw, "screens"))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+        (entry,) = self.manifest()
+        self.assertEqual(set(entry), {"t", "file", "window_title", "w", "h", "manual"})
+        self.assertIs(entry["manual"], True)
+        self.assertEqual((entry["w"], entry["h"]), (768, 512))
+        self.assertEqual(entry["window_title"], "Weekly sync")
+        self.assertAlmostEqual(entry["t"], 65.0, delta=3)
+        self.assertIn("-T call1 -t jpeg", Path(self.d, "grim.log").read_text())
+        (note,) = self.notifications()
+        self.assertEqual(note[:6], ["-a", "Meeting snap", "-c", "meet-recorder.snap",
+                                    "-t", "2500"])
+        self.assertIn(path, note)
+        self.assertIn(f"string:image-path:{path}", note)
+        self.assertNotIn("critical", note)
+        self.assertEqual(note[-2:], ["Screen saved",
+                                     f"{mr.fmt_ts(entry['t'])} · Weekly sync"])
+        # a second snap at once: never replaces the first, count goes up
+        self.assertEqual(self.cli("snap").returncode, 0)
+        files = [e["file"] for e in self.manifest()]
+        self.assertEqual(len(set(files)), 2)
+        st = json.loads(self.cli("status", "--json").stdout)
+        self.assertEqual(st["snaps"], 2)
+        self.assertAlmostEqual(st["last_snap_unix"], time.time(), delta=5)
+
+    def test_focused_window(self):
+        self.record()
+        r = self.cli("snap", "--window", "focused")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("-T foot1", Path(self.d, "grim.log").read_text())
+        self.assertEqual(self.manifest()[0]["window_title"], "notes")
+        self.assertEqual(self.cli("snap", "--window", "bogus").returncode, 2)
+
+    def test_not_recording_fails_visibly(self):
+        r = self.cli("snap")
+        self.assertEqual(r.returncode, 1)
+        (note,) = self.notifications()
+        self.assertIn("-u", note)
+        self.assertIn("critical", note)
+        self.assertEqual(note[-2][:len("Screen NOT saved")], "Screen NOT saved")
+        self.assertIn("not recording", note[-2])
+        self.assertFalse(os.path.exists(os.path.join(self.d, "grim.log")))
+        self.assertEqual(json.loads(self.cli("status", "--json").stdout)["snaps"], 0)
+
+    def test_budget_is_respected(self):
+        Path(self.cfg).write_text("[screens]\nmax_mb = 0.00001\n")
+        self.record()
+        r = self.cli("snap")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("budget", self.notifications()[0][-2])
+        self.assertFalse(os.path.exists(os.path.join(self.raw, "screens.jsonl")))
+
+    def test_capture_failure_is_reported(self):
+        self.script("grim", "echo nope >&2; exit 1")
+        self.record()
+        self.assertEqual(self.cli("snap").returncode, 1)
+        note = self.notifications()[0]
+        self.assertIn("critical", note)
+        self.assertTrue(note[-2].startswith("Screen NOT saved — grim failed"))
+
+
+class TestManualFramesDownstream(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = self._tmp.name
+        self.saved = mr.CACHE_DIR
+        mr.CACHE_DIR = os.path.join(self.d, "cache")
+        os.makedirs(mr.CACHE_DIR)
+
+    def tearDown(self):
+        mr.CACHE_DIR = self.saved
+        self._tmp.cleanup()
+
+    def test_manual_frames_survive_collect_and_are_marked(self):
+        raw = os.path.join(mr.CACHE_DIR, "s1")
+        os.makedirs(os.path.join(raw, "screens"))
+        folder = os.path.join(self.d, "out")
+        os.makedirs(folder)
+        Path(folder, "meta.json").write_text("{}")
+        lines = []
+        # an automatic frame and a manual one 0.1 s later (same picture):
+        # both are kept, nothing is deduplicated
+        for t, manual in ((10.0, False), (10.1, True)):
+            name = mr.screen_file_name(t)
+            Path(raw, "screens", name).write_bytes(b"\xff\xd8same")
+            e = {"t": t, "file": name, "window_title": "Deck", "w": 1, "h": 1}
+            if manual:
+                e["manual"] = True
+            lines.append(json.dumps(e))
+        Path(raw, "screens.jsonl").write_text("\n".join(lines) + "\n")
+        with mock.patch.object(mr, "CONFIG_FILE",
+                               make_cfg(self.d, "[screens]\nmin_free_mb = 0\n")):
+            self.assertEqual(mr.collect_screens(raw, folder), 2)
+        frames = mr.read_frames(folder)
+        self.assertEqual([f.get("manual") for f in frames], [None, True])
+        self.assertFalse(os.path.exists(raw))
+        md = mr.render_moments(frames, [])
+        self.assertIn("## 00:10 — Deck — 📌 marked by you", md)
+        self.assertEqual(md.count("📌"), 1)
+
+    def test_link_screens_prefers_a_manual_frame_in_the_window(self):
+        frames = [{"t": 50.0, "file": "00050.0s.jpg", "manual": True},
+                  {"t": 95.0, "file": "00095.0s.jpg"},
+                  {"t": 300.0, "file": "00300.0s.jpg"},
+                  {"t": 305.0, "file": "00305.0s.jpg", "manual": True}]
+        self.assertEqual(mr.pick_frame(frames, 100)["t"], 50.0)     # not 95
+        self.assertEqual(mr.pick_frame(frames, 299)["t"], 305.0)   # after, within 15 s
+        self.assertEqual(mr.pick_frame(frames, 180)["t"], 95.0)    # no manual near
+        text = mr.link_screens("- Ship it [01:40]\n", frames)
+        self.assertIn("(screens/00050.0s.jpg)", text)
+        self.assertEqual(mr.link_screens(text, frames), text)        # idempotent
+
+
+class TestSnapHotkeyInstaller(unittest.TestCase):
+    SCRIPT = os.path.join(HERE, "..", "install-hypr-bind.sh")
+    ANCHOR = 'o.bind("SUPER + SHIFT + R", "Meeting recorder", "meet-recorder toggle")'
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = self._tmp.name
+        self.file = os.path.join(self.d, "bindings.lua")
+        self.orig = ("-- my bindings\n"
+                     'o.bind("SUPER + RETURN", "Terminal", { launch = "foot" })\n'
+                     f"{self.ANCHOR}\n"
+                     'o.bind("SUPER + B", "Browser", { launch = "chromium" })\n')
+        Path(self.file).write_text(self.orig)
+        self.binds = os.path.join(self.d, "binds.json")
+        self.errors = os.path.join(self.d, "errors.txt")
+        self.calls = os.path.join(self.d, "calls.log")
+        Path(self.binds).write_text(json.dumps([
+            {"modmask": 65, "key": "R", "description": "Meeting recorder"},
+            {"modmask": 68, "key": "R", "description": "Set reminder"}]))
+        Path(self.errors).write_text("\n\n")
+        self.hyprctl = os.path.join(self.d, "hyprctl")
+        Path(self.hyprctl).write_text(
+            "#!/bin/sh\n"
+            f"echo \"$@\" >> {self.calls}\n"
+            "case \"$1\" in\n"
+            f"  binds) cat {self.binds};;\n"
+            f"  configerrors) cat {self.errors};;\n"
+            "esac\n")
+        os.chmod(self.hyprctl, 0o755)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_it(self):
+        return subprocess.run(["bash", self.SCRIPT, self.file], capture_output=True,
+                              text=True, env=dict(os.environ, HYPRCTL=self.hyprctl),
+                              timeout=30)
+
+    def reloads(self):
+        try:
+            return Path(self.calls).read_text().split().count("reload")
+        except FileNotFoundError:
+            return 0
+
+    def test_inserts_once_after_the_toggle_and_reloads_only_on_change(self):
+        r = self.run_it()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        want = 'o.bind("SUPER + ALT + R", "Meeting snap", "meet-recorder snap")'
+        lines = Path(self.file).read_text().splitlines()
+        self.assertEqual(lines[lines.index(self.ANCHOR) + 1], want)
+        self.assertEqual(self.reloads(), 1)
+        self.assertEqual(self.run_it().returncode, 0)                # again
+        self.assertEqual(Path(self.file).read_text().count("meet-recorder snap"), 1)
+        self.assertEqual(self.reloads(), 1)                          # unchanged
+        self.assertEqual(Path(self.file).read_text(),
+                         self.orig.replace(self.ANCHOR, self.ANCHOR + "\n" + want))
+        self.assertEqual(sorted(os.listdir(self.d)),
+                         sorted(["bindings.lua", "binds.json", "errors.txt",
+                                 "calls.log", "hyprctl"]))           # no leftovers
+
+    def test_falls_back_when_super_alt_r_is_taken(self):
+        Path(self.binds).write_text(json.dumps([{"modmask": 72, "key": "r"}]))
+        self.assertEqual(self.run_it().returncode, 0)
+        self.assertIn('o.bind("SUPER + SHIFT + U", "Meeting snap", "meet-recorder snap")',
+                      Path(self.file).read_text())
+
+    def test_config_errors_revert_the_line(self):
+        Path(self.errors).write_text("bindings.lua:4: bad bind\n")
+        r = self.run_it()
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("reverted", r.stderr)
+        self.assertEqual(Path(self.file).read_text(), self.orig)
+        self.assertEqual(self.reloads(), 2)                          # add + revert
+
+    def test_missing_anchor_changes_nothing(self):
+        Path(self.file).write_text("-- nothing here\n")
+        r = self.run_it()
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("not found", r.stderr)
+        self.assertEqual(Path(self.file).read_text(), "-- nothing here\n")
+        self.assertEqual(self.reloads(), 0)
+
+    def test_install_local_calls_it(self):
+        inst = Path(HERE, "..", "install-local.sh").read_text()
+        self.assertIn("./install-hypr-bind.sh", inst)
+        self.assertTrue(os.access(self.SCRIPT, os.X_OK))
+
+
 class TestLatestFolder(unittest.TestCase):
     def test_newest_with_transcript_any_source(self):
         with tempfile.TemporaryDirectory() as d:
