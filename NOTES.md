@@ -29,8 +29,11 @@ with faster-whisper. Zero network/cloud use at runtime.
 3. **No secrets in this repo, ever.**
 4. Config defaults live in `meet-recorder`; `~/.config/meet-recorder/config.ini`
    overrides (`model`, paths). `config.ini.example` shows the shape.
-5. `master` is the shared branch — `git push origin master` syncs the VPS
-   canonical repo (`/srv/meet-recorder.git`).
+5. `master` is the shared branch — **GitHub (`kabukisensei/meet-recorder`)
+   is canonical** (remote `origin` on the VPS clone). The SER9 pushes to the
+   VPS bare repo (`vps-repo:/srv/meet-recorder.git`, remote `vps`), whose
+   post-receive hook mirrors `master` to GitHub automatically. If you clone
+   fresh, clone from GitHub.
 
 ## Test
 
