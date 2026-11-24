@@ -38,9 +38,12 @@ WATCH_FILE = os.path.join(STATE_DIR, "watch.json")   # heartbeat of the auto-rec
 LOCK_FILE = os.path.join(STATE_DIR, "lock")          # serializes start/stop
 
 DEFAULTS = {
-    "audio": {"sys_volume": "1.0", "mic_volume": "2.0", "sample_rate": "16000"},
+    "audio": {"sys_volume": "1.0", "mic_volume": "2.0", "sample_rate": "16000",
+              "mic_source": "auto"},
     "whisper": {"model": "small", "device": "cpu",
-                "compute_type": "int8", "beam_size": "5"},
+                "compute_type": "int8", "beam_size": "5",
+                # Vocabulary/context for both tracks (names, product terms).
+                "initial_prompt": "", "condition_on_previous_text": "true"},
     "paths": {"output_dir": "~/Recordings"},
     # Optional post-transcription summarizer: command run detached after
     # a successful transcription; {folder} is replaced with the session
@@ -367,6 +370,98 @@ def app_device(streams, devices, apps, key, default):
         if name and not name.endswith(".monitor") and name != default:
             return name
     return ""
+
+
+# The echo-cancelled mic shipped in pipewire/50-meet-recorder-aec.conf.
+AEC_SOURCE = "meet-recorder.aec-mic"
+# pactl source states in which the node exists and starts when pulled
+# (with passive streams the AEC source idles as SUSPENDED until recorded).
+USABLE_SOURCE_STATES = {"RUNNING", "IDLE", "SUSPENDED"}
+
+
+def mic_source_setting(value):
+    """Normalise `[audio] mic_source`: 'auto' (blank too), 'raw', or a
+    PipeWire node.name kept verbatim."""
+    value = (value or "").strip()
+    if value.lower() in ("", "auto"):
+        return "auto"
+    return "raw" if value.lower() == "raw" else value
+
+
+def is_echo_cancel_source(source):
+    """A pactl source dict that is an echo-cancel module's output."""
+    props = source.get("properties", {}) or {}
+    return (source.get("name") == AEC_SOURCE
+            or str(props.get("node.link-group", "")).startswith("echo-cancel"))
+
+
+def pick_mic_source(setting, sources, pinned=""):
+    """Which source the mic recorder captures.
+
+    setting: mic_source_setting(); sources: parsed `pactl -f json list
+    sources`; pinned: app_device() for the call app's mic ('' = default).
+    Returns (target, echo_cancel, note): target '' = no --target, follow
+    the default mic. Never fails: anything missing falls back to the
+    previous behaviour (default mic, or the call app's pinned mic).
+    'auto' skips AEC when the call app uses a non-default mic: the AEC
+    capture follows the DEFAULT mic, so it would record the wrong one.
+    """
+    by_name = {s.get("name"): s for s in sources or [] if s.get("name")}
+    if setting == "raw":
+        return pinned, False, "raw mic (mic_source = raw)"
+    if setting == "auto":
+        if pinned:
+            return pinned, False, "raw mic: call app uses a non-default mic"
+        src = by_name.get(AEC_SOURCE)
+        if src is None:
+            return "", False, "raw mic: echo-cancel source not loaded"
+        state = str(src.get("state", "")).upper()
+        if state not in USABLE_SOURCE_STATES:
+            return "", False, f"raw mic: echo-cancel source is {state or '?'}"
+        return AEC_SOURCE, True, "echo-cancelled mic"
+    src = by_name.get(setting)
+    if src is None:
+        return pinned, False, f"raw mic: mic_source {setting!r} not found"
+    return setting, is_echo_cancel_source(src), f"mic_source {setting}"
+
+
+# A track whose peak never exceeds this (of 32767) is digital silence.
+SILENT_PEAK = 2
+
+
+def pick_mic_track(aec, raw):
+    """Choose the mic track after recording with echo cancellation.
+
+    aec / raw: wav_stats() of the echo-cancelled and the raw-mic WAV, or
+    None (missing, empty, unreadable). Returns 'aec' or 'raw'. The AEC
+    track is used unless it is evidently broken while the raw one is not:
+    missing, digital silence (an AEC node that never ran), or less than
+    half as long (it stalled). Unknown peaks (non-16-bit) count as fine.
+    """
+    if raw is None:
+        return "aec"
+    if aec is None:
+        return "raw"
+    if raw["seconds"] > 5 and aec["seconds"] < raw["seconds"] / 2:
+        return "raw"
+    if (aec["peak"] is not None and aec["peak"] <= SILENT_PEAK
+            and (raw["peak"] is None or raw["peak"] > SILENT_PEAK)):
+        return "raw"
+    return "aec"
+
+
+def whisper_options(cfg):
+    """faster-whisper transcribe() keyword arguments from [whisper].
+    Raises ValueError on a malformed value (before the model loads)."""
+    beam = cfg.getint("whisper", "beam_size")
+    if beam < 1:
+        raise ValueError(f"[whisper] beam_size must be >= 1, not {beam}")
+    prompt = cfg.get("whisper", "initial_prompt", raw=True,
+                     fallback="").strip()
+    return {"beam_size": beam, "vad_filter": True,
+            "initial_prompt": prompt or None,
+            "condition_on_previous_text": cfg.getboolean(
+                "whisper", "condition_on_previous_text")}
 
 
 def pick_meeting_title(titles):
@@ -1157,7 +1252,9 @@ def start_settings(cfg):
     malformed value must fail the start, never strand running recorders."""
     rate = str(int(cfg.get("audio", "sample_rate")))
     return {"rate": rate, "apps": auto_apps(cfg),
-            "screens": screens_enabled(cfg)}
+            "screens": screens_enabled(cfg),
+            "mic_source": mic_source_setting(
+                cfg.get("audio", "mic_source", raw=True, fallback="auto"))}
 
 
 def pactl_default(kind):
@@ -1217,10 +1314,15 @@ def start_locked(cfg, source, stale=None):
         run_json(["pactl", "-f", "json", "list", "sink-inputs"], []),
         run_json(["pactl", "-f", "json", "list", "sinks"], []),
         apps, "sink", sink)
+    sources = run_json(["pactl", "-f", "json", "list", "sources"], [])
     pin_mic = app_device(
         run_json(["pactl", "-f", "json", "list", "source-outputs"], []),
-        run_json(["pactl", "-f", "json", "list", "sources"], []),
-        apps, "source", mic)
+        sources, apps, "source", mic)
+    # Mic: the echo-cancelled source when it is there (the far side played
+    # through speakers is removed from me.m4a), else as before.
+    mic_target, echo, mic_note = pick_mic_source(settings["mic_source"],
+                                                 sources, pin_mic)
+    print(f"mic: {mic_note}", file=sys.stderr)
     sink, mic = pin_sink or sink, pin_mic or mic
     title = meeting_title(cfg)
 
@@ -1229,7 +1331,17 @@ def start_locked(cfg, source, stale=None):
     sess_dir = os.path.join(CACHE_DIR, session_id)
     sys_wav = os.path.join(sess_dir, "sys.wav")
     mic_wav = os.path.join(sess_dir, "mic.wav")
+    # With AEC the raw mic is recorded too: finalize falls back to it if
+    # the AEC track turns out silent/stalled, so AEC can never cost audio.
+    mic_raw_wav = os.path.join(sess_dir, "mic-raw.wav") if echo else ""
     base = ["pw-record", "--channels", "1", "--rate", rate]
+    argvs = [base + ["-P", "{ stream.capture.sink = true }"]
+             + (["--target", pin_sink] if pin_sink else []) + [sys_wav],
+             base + (["--target", mic_target] if mic_target else [])
+             + [mic_wav]]
+    if echo:
+        argvs.append(base + (["--target", pin_mic] if pin_mic else [])
+                     + [mic_raw_wav])
     procs, worker = [], None
     # Everything from the first spawn to the published state is one unit:
     # any failure (or exception) stops what was spawned and removes the raw
@@ -1241,15 +1353,16 @@ def start_locked(cfg, source, stale=None):
         # wall time names the folder, the monotonic origin times the frames.
         start_unix, origin = int(time.time()), time.monotonic()
         children = []
-        for argv in (base + ["-P", "{ stream.capture.sink = true }"]
-                     + (["--target", pin_sink] if pin_sink else []) + [sys_wav],
-                     base + (["--target", pin_mic] if pin_mic else [])
-                     + [mic_wav]):
+        for argv in argvs:
             p = subprocess.Popen(argv, **quiet)
             children.append(p)
             procs.append((p.pid, proc_start(p.pid)))
         time.sleep(0.4)
-        if any(p.poll() is not None for p in children):
+        # The speaker side plus at least one mic recorder must be up (a
+        # dead AEC recorder is fine while the raw-mic one runs: finalize
+        # then uses the raw track).
+        if (children[0].poll() is not None
+                or all(p.poll() is not None for p in children[1:])):
             raise RuntimeError("pw-record failed to open the speaker or "
                                "microphone.")
         state = {"id": session_id, "pids": [p for p, _ in procs],
@@ -1257,7 +1370,10 @@ def start_locked(cfg, source, stale=None):
                  "start": start_unix, "origin": origin,
                  "session_dir": sess_dir, "sys_wav": sys_wav,
                  "mic_wav": mic_wav, "source": source, "title": title,
-                 "sink": sink, "mic": mic}
+                 "sink": sink, "mic": mic, "mic_source": mic_target,
+                 "mic_echo_cancel": echo}
+        if echo:
+            state["mic_raw_wav"] = mic_raw_wav
         if settings["screens"]:
             worker = spawn_screens(sess_dir, session_id, origin)
             if worker:
@@ -1289,13 +1405,13 @@ def transcribe(paths, cfg):
         print("faster-whisper is not installed. Install it in your venv:\n"
               "    pip install faster-whisper", file=sys.stderr)
         sys.exit(3)
+    options = whisper_options(cfg)      # a bad value fails before the load
     model = WhisperModel(cfg.get("whisper", "model"),
                          device=cfg.get("whisper", "device"),
                          compute_type=cfg.get("whisper", "compute_type"))
     results = []
     for path in paths:
-        segments, info = model.transcribe(
-            path, beam_size=cfg.getint("whisper", "beam_size"), vad_filter=True)
+        segments, info = model.transcribe(path, **options)
         results.append(([(s.start, s.end, s.text) for s in segments],
                         getattr(info, "duration", 0.0)))
     return results
@@ -1351,9 +1467,53 @@ def write_transcripts(folder, segments, start_unix, duration, title="",
     return None
 
 
+def wav_stats(path):
+    """{'seconds', 'peak'} of a WAV, or None if missing/tiny/unreadable.
+    peak (max |sample|) only for 16-bit audio, else None. Reads in chunks
+    (an hour of 16 kHz mono is ~115 MB)."""
+    import array
+    import wave
+    try:
+        if os.path.getsize(path) <= 1024:
+            return None
+        with wave.open(path, "rb") as w:
+            rate, width = w.getframerate(), w.getsampwidth()
+            frames, peak = w.getnframes(), (0 if width == 2 else None)
+            if peak is not None:
+                while True:
+                    chunk = w.readframes(1 << 18)
+                    if not chunk:
+                        break
+                    a = array.array("h")
+                    a.frombytes(chunk[:len(chunk) // 2 * 2])
+                    if sys.byteorder == "big":
+                        a.byteswap()
+                    if a:
+                        peak = max(peak, max(a), -min(a))
+    except (OSError, EOFError, wave.Error):
+        return None
+    if not frames or not rate:
+        return None
+    return {"seconds": frames / rate, "peak": peak}
+
+
+def choose_mic_wav(state):
+    """(mic WAV to use, echo_cancel) for a stopped session. Sessions
+    recorded with AEC also have the raw mic; see pick_mic_track."""
+    mic_wav, raw = state["mic_wav"], state.get("mic_raw_wav")
+    if not (state.get("mic_echo_cancel") and raw):
+        return mic_wav, bool(state.get("mic_echo_cancel"))
+    if pick_mic_track(wav_stats(mic_wav), wav_stats(raw)) == "raw":
+        print("echo-cancelled mic track unusable; using the raw mic",
+              file=sys.stderr)
+        return raw, False
+    return mic_wav, True
+
+
 def finalize_audio(state, cfg):
     """Mix the raw tracks into the output folder; returns the folder path."""
-    sys_wav, mic_wav = state["sys_wav"], state["mic_wav"]
+    sys_wav = state["sys_wav"]
+    mic_wav, echo = choose_mic_wav(state)
     start_unix = state["start"]
     have =[w for w in (sys_wav, mic_wav)
             if os.path.exists(w) and os.path.getsize(w) > 1024]
@@ -1392,7 +1552,8 @@ def finalize_audio(state, cfg):
     # screen data: the raw dir (frames, manifest, log) belongs to the
     # separate collect-screens job, which also removes it, so no screen
     # problem can delay or fail the audio or the transcription.
-    for wav in (sys_wav, mic_wav):
+    for wav in filter(None, {sys_wav, state["mic_wav"],
+                             state.get("mic_raw_wav")}):
         try:
             os.remove(wav)
         except OSError:
@@ -1405,6 +1566,7 @@ def finalize_audio(state, cfg):
         "tracks": [os.path.basename(w) for w in have],
         "speaker_device": state.get("sink", ""),
         "mic_device": state.get("mic", ""),
+        "mic_echo_cancel": echo and mic_wav in have,
         "audio": "meeting.m4a", "transcript": "transcript.md",
         "transcript_status": "pending",
     })

@@ -340,6 +340,233 @@ class TestAppDevice(unittest.TestCase):
         self.assertEqual(mr.app_device([], self.DEVS, ["teams"], "sink", "hdmi"), "")
 
 
+class TestMicSource(unittest.TestCase):
+    RAW = {"name": "alsa_input.webcam", "state": "RUNNING", "properties": {}}
+
+    def aec(self, state="SUSPENDED", name=None):
+        return {"name": name or mr.AEC_SOURCE, "state": state,
+                "properties": {"node.link-group": "echo-cancel-1234"}}
+
+    def test_setting_normalised(self):
+        for v, want in (("", "auto"), (None, "auto"), ("  AUTO ", "auto"),
+                        ("Raw", "raw"), (" my.Node ", "my.Node")):
+            self.assertEqual(mr.mic_source_setting(v), want)
+
+    def test_auto_uses_aec_when_present_in_any_live_state(self):
+        for st in ("RUNNING", "IDLE", "SUSPENDED", "running"):
+            target, echo, _ = mr.pick_mic_source(
+                "auto", [self.RAW, self.aec(st)])
+            self.assertEqual((target, echo), (mr.AEC_SOURCE, True), st)
+
+    def test_auto_falls_back_to_default_mic(self):
+        for sources in ([self.RAW], [], None,
+                        [self.RAW, self.aec("INVALID")], [self.aec("")]):
+            target, echo, note = mr.pick_mic_source("auto", sources)
+            self.assertEqual((target, echo), ("", False), sources)
+            self.assertTrue(note.startswith("raw mic"))
+
+    def test_auto_keeps_pinned_mic_of_call_app(self):
+        # AEC follows the DEFAULT mic; Teams on another mic wins.
+        self.assertEqual(
+            mr.pick_mic_source("auto", [self.RAW, self.aec()], "headset")[:2],
+            ("headset", False))
+
+    def test_raw(self):
+        self.assertEqual(mr.pick_mic_source("raw", [self.aec()])[:2],
+                         ("", False))
+        self.assertEqual(mr.pick_mic_source("raw", [self.aec()], "hs")[:2],
+                         ("hs", False))
+
+    def test_explicit_node(self):
+        self.assertEqual(
+            mr.pick_mic_source("alsa_input.webcam", [self.RAW])[:2],
+            ("alsa_input.webcam", False))
+        other_aec = self.aec(name="my-echo-cancel-source")
+        self.assertEqual(
+            mr.pick_mic_source("my-echo-cancel-source", [other_aec])[:2],
+            ("my-echo-cancel-source", True))
+        # missing -> previous behaviour, never a failure
+        self.assertEqual(mr.pick_mic_source("gone", [self.RAW], "hs")[:2],
+                         ("hs", False))
+
+
+class TestPickMicTrack(unittest.TestCase):
+    def st(self, seconds=600.0, peak=9000):
+        return {"seconds": seconds, "peak": peak}
+
+    def test_good_aec_wins(self):
+        self.assertEqual(mr.pick_mic_track(self.st(), self.st()), "aec")
+        # a quiet but live AEC track (user never spoke) is still AEC
+        self.assertEqual(mr.pick_mic_track(self.st(peak=40), self.st()), "aec")
+
+    def test_missing_tracks(self):
+        self.assertEqual(mr.pick_mic_track(None, self.st()), "raw")
+        self.assertEqual(mr.pick_mic_track(self.st(), None), "aec")
+        self.assertEqual(mr.pick_mic_track(None, None), "aec")
+
+    def test_digital_silence_falls_back(self):
+        self.assertEqual(mr.pick_mic_track(self.st(peak=0), self.st()), "raw")
+        self.assertEqual(mr.pick_mic_track(self.st(peak=2), self.st()), "raw")
+        # both silent: nothing to gain, keep AEC
+        self.assertEqual(mr.pick_mic_track(self.st(peak=0), self.st(peak=0)),
+                         "aec")
+        # unknown peak (non-16-bit) is not evidence of silence
+        self.assertEqual(mr.pick_mic_track(self.st(peak=None), self.st()),
+                         "aec")
+
+    def test_stalled_falls_back(self):
+        self.assertEqual(mr.pick_mic_track(self.st(seconds=200), self.st()),
+                         "raw")
+        self.assertEqual(mr.pick_mic_track(self.st(seconds=400), self.st()),
+                         "aec")
+        # very short recordings: duration noise is not a stall
+        self.assertEqual(mr.pick_mic_track(self.st(seconds=1),
+                                           self.st(seconds=4)), "aec")
+
+
+class TestWavStatsAndChoice(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.d)
+
+    def wav(self, name, samples, rate=16000):
+        import array
+        import wave
+        path = os.path.join(self.d, name)
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            a = array.array("h", samples)
+            if sys.byteorder == "big":
+                a.byteswap()
+            w.writeframes(a.tobytes())
+        return path
+
+    def test_stats(self):
+        p = self.wav("a.wav", [0, 5, -300, 7] * 4000)
+        self.assertEqual(mr.wav_stats(p), {"seconds": 1.0, "peak": 300})
+        self.assertIsNone(mr.wav_stats(os.path.join(self.d, "missing.wav")))
+        self.assertIsNone(mr.wav_stats(self.wav("tiny.wav", [1] * 10)))
+        junk = os.path.join(self.d, "junk.wav")
+        Path(junk).write_bytes(b"x" * 4096)
+        self.assertIsNone(mr.wav_stats(junk))
+
+    def test_choose_mic_wav(self):
+        live = self.wav("mic-raw.wav", [0, 1000, -1000, 3] * 40000)
+        silent = self.wav("mic.wav", [0] * 160000)
+        state = {"mic_wav": silent, "mic_raw_wav": live,
+                 "mic_echo_cancel": True}
+        self.assertEqual(mr.choose_mic_wav(state), (live, False))
+        good = self.wav("aec.wav", [0, 200, -50, 3] * 40000)
+        self.assertEqual(mr.choose_mic_wav(dict(state, mic_wav=good)),
+                         (good, True))
+        # no AEC / sessions from before this feature
+        self.assertEqual(mr.choose_mic_wav({"mic_wav": silent}),
+                         (silent, False))
+
+    def finalize(self, aec_samples):
+        sess = os.path.join(self.d, "raw")
+        os.mkdir(sess)
+        noise = [0, 900, -900, 40] * 8000                 # 2 s
+        state = {"start": 1795530225, "source": "teams", "title": "",
+                 "sys_wav": self.wav("raw/sys.wav", noise),
+                 "mic_wav": self.wav("raw/mic.wav", aec_samples),
+                 "mic_raw_wav": self.wav("raw/mic-raw.wav", noise),
+                 "mic_echo_cancel": True}
+        cfg = mr.load_config(os.devnull)
+        cfg.set("paths", "output_dir", os.path.join(self.d, "out"))
+        folder = mr.finalize_audio(state, cfg)
+        return folder, mr.read_json(os.path.join(folder, "meta.json")), sess
+
+    @unittest.skipUnless(__import__("shutil").which("ffmpeg"), "no ffmpeg")
+    def test_finalize_meta_and_cleanup(self):
+        folder, meta, sess = self.finalize([0, 300, -300, 5] * 8000)
+        self.assertIs(meta["mic_echo_cancel"], True)
+        self.assertEqual(meta["tracks"], ["sys.wav", "mic.wav"])
+        self.assertTrue(os.path.exists(os.path.join(folder, "me.m4a")))
+        self.assertEqual(os.listdir(sess), [])      # all three WAVs gone
+        __import__("shutil").rmtree(self.d)
+        os.mkdir(self.d)
+        _, meta, sess = self.finalize([0] * 32000)  # AEC never ran
+        self.assertIs(meta["mic_echo_cancel"], False)
+        self.assertEqual(meta["tracks"], ["sys.wav", "mic-raw.wav"])
+        self.assertEqual(os.listdir(sess), [])
+
+
+class TestWhisperOptions(unittest.TestCase):
+    def cfg(self, text=""):
+        with tempfile.NamedTemporaryFile("w", suffix=".ini",
+                                         delete=False) as f:
+            f.write(text)
+        self.addCleanup(os.remove, f.name)
+        return mr.load_config(f.name)
+
+    def test_defaults(self):
+        self.assertEqual(mr.whisper_options(self.cfg()), {
+            "beam_size": 5, "vad_filter": True, "initial_prompt": None,
+            "condition_on_previous_text": True})
+        self.assertEqual(self.cfg().get("audio", "mic_source"), "auto")
+
+    def test_overrides(self):
+        opts = mr.whisper_options(self.cfg(
+            "[whisper]\nbeam_size = 8\ncondition_on_previous_text = no\n"
+            "initial_prompt = Tanner, FocusTime, 100% uptime, SER9\n"))
+        self.assertEqual(opts["beam_size"], 8)
+        self.assertFalse(opts["condition_on_previous_text"])
+        # read raw: a literal % is fine
+        self.assertEqual(opts["initial_prompt"],
+                         "Tanner, FocusTime, 100% uptime, SER9")
+        self.assertIsNone(mr.whisper_options(self.cfg(
+            "[whisper]\ninitial_prompt =   \n"))["initial_prompt"])
+
+    def test_bad_values_raise(self):
+        for text in ("[whisper]\nbeam_size = 0\n",
+                     "[whisper]\nbeam_size = x\n",
+                     "[whisper]\ncondition_on_previous_text = maybe\n"):
+            with self.assertRaises(ValueError, msg=text):
+                mr.whisper_options(self.cfg(text))
+
+    def test_transcribe_passes_options(self):
+        calls = []
+
+        class Model:
+            def __init__(self, *a, **k):
+                pass
+
+            def transcribe(self, path, **kw):
+                calls.append((path, kw))
+                return iter([]), mock.Mock(duration=1.0)
+
+        fake = mock.Mock(WhisperModel=Model)
+        cfg = self.cfg("[whisper]\ninitial_prompt = Omarchy\n")
+        with mock.patch.dict(sys.modules, {"faster_whisper": fake}):
+            mr.transcribe(["me.m4a", "others.m4a"], cfg)
+        self.assertEqual([p for p, _ in calls], ["me.m4a", "others.m4a"])
+        for _, kw in calls:
+            self.assertEqual(kw["initial_prompt"], "Omarchy")
+            self.assertEqual(kw["beam_size"], 5)
+            self.assertTrue(kw["condition_on_previous_text"])
+
+
+class TestAecConf(unittest.TestCase):
+    """The shipped drop-in must keep the never-default rules."""
+    CONF = Path(HERE, "..", "pipewire", "50-meet-recorder-aec.conf")
+
+    def test_conf(self):
+        text = re.sub(r"#.*", "", self.CONF.read_text())
+        self.assertIn("libpipewire-module-echo-cancel", text)
+        self.assertIn("library.name = aec/libspa-aec-webrtc", text)
+        self.assertIn("monitor.mode = true", text)
+        self.assertIn(f'node.name = "{mr.AEC_SOURCE}"', text)
+        self.assertIn("priority.session = 1", text)
+        self.assertIn("priority.driver = 1", text)
+        # a smart filter would be spliced into every app's mic path
+        self.assertNotIn("filter.smart", text)
+        self.assertEqual(text.count("{"), text.count("}"))
+        self.assertEqual(text.count("["), text.count("]"))
+
+
 class TestVttTimestamp(unittest.TestCase):
     def test_zero_and_hours_always_present(self):
         self.assertEqual(mr.fmt_vtt_ts(0), "00:00:00.000")
@@ -1641,9 +1868,12 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
             mr.recover_if_stale()
         self.assertEqual(seen, [True])
 
-    def start_env(self, spawn=None, cfg_body=None):
+    def start_env(self, spawn=None, cfg_body=None, sources=(), argvs=None,
+                  die=()):
         """Patches for cmd_start: fake pw-record (sleep) and pactl; returns
-        the list of spawned recorder Popens."""
+        the list of spawned recorder Popens. sources: `pactl list sources`;
+        argvs collects the pw-record argvs; die: output basenames whose
+        recorder exits at once."""
         real_popen = subprocess.Popen
         mr.CACHE_DIR, saved_cache = os.path.join(self.d, "cache"), mr.CACHE_DIR
         self.addCleanup(setattr, mr, "CACHE_DIR", saved_cache)
@@ -1653,16 +1883,22 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
 
         def fake_popen(argv, **kw):
             if argv[0] == "pw-record":
-                p = real_popen(["sleep", "60"], **kw)
+                if argvs is not None:
+                    argvs.append(argv)
+                dies = os.path.basename(argv[-1]) in die
+                p = real_popen(["true"] if dies else ["sleep", "60"], **kw)
                 self.children.append(p)
                 spawned.append(p)
                 return p
             return real_popen(argv, **kw)
+
+        def fake_run_json(argv, *a, **k):
+            return list(sources) if argv[-1] == "sources" else []
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.object(mr.subprocess, "Popen", fake_popen))
         stack.enter_context(mock.patch.object(mr.subprocess, "check_output",
                                               lambda *a, **k: "default\n"))
-        stack.enter_context(mock.patch.object(mr, "run_json", lambda *a, **k: []))
+        stack.enter_context(mock.patch.object(mr, "run_json", fake_run_json))
         stack.enter_context(mock.patch.object(mr, "notify", lambda *a: None))
         if spawn is not None:
             stack.enter_context(mock.patch.object(mr, "spawn_screens", spawn))
@@ -1680,6 +1916,47 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
                                  cfg_body="[screens]\nenabled = %\n")
         self.assertEqual(mr.cmd_start(), 0)
         self.assertEqual(len(spawned), 2)
+        self.assertTrue(mr.session_live(mr.read_state()))
+
+    AEC = {"name": "meet-recorder.aec-mic", "state": "SUSPENDED",
+           "properties": {"node.link-group": "echo-cancel-1"}}
+
+    def test_start_records_aec_plus_raw_fallback(self):
+        argvs = []
+        spawned = self.start_env(spawn=lambda *a: None, sources=[self.AEC],
+                                 argvs=argvs)
+        self.assertEqual(mr.cmd_start(), 0)
+        self.assertEqual(len(spawned), 3)
+        st = mr.read_state()
+        self.assertTrue(st["mic_echo_cancel"])
+        self.assertEqual(st["mic_source"], mr.AEC_SOURCE)
+        self.assertEqual(len(st["pids"]), 3)
+        sys_argv, aec_argv, raw_argv = argvs
+        self.assertIn("stream.capture.sink", " ".join(sys_argv))
+        self.assertEqual(aec_argv[-3:], ["--target", mr.AEC_SOURCE,
+                                         st["mic_wav"]])
+        self.assertNotIn("--target", raw_argv)      # follows the default mic
+        self.assertEqual(raw_argv[-1], st["mic_raw_wav"])
+
+    def test_start_without_aec_or_raw_setting_is_unchanged(self):
+        for sources, body in (([], None), ([self.AEC], "[audio]\nmic_source = raw\n")):
+            argvs = []
+            mr.clear_state()
+            self.start_env(spawn=lambda *a: None, sources=sources,
+                           argvs=argvs, cfg_body=body)
+            self.assertEqual(mr.cmd_start(), 0)
+            st = mr.read_state()
+            self.assertFalse(st["mic_echo_cancel"])
+            self.assertNotIn("mic_raw_wav", st)
+            self.assertEqual(len(argvs), 2)
+            self.assertNotIn("--target", argvs[1])
+            mr.stop_procs(mr.state_procs(st), None, timeout=1)
+
+    def test_dead_aec_recorder_does_not_fail_start(self):
+        spawned = self.start_env(spawn=lambda *a: None, sources=[self.AEC],
+                                 die={"mic.wav"})
+        self.assertEqual(mr.cmd_start(), 0)
+        self.assertEqual(len(spawned), 3)
         self.assertTrue(mr.session_live(mr.read_state()))
 
     def test_failure_after_spawning_leaves_no_orphan(self):

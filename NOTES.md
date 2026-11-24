@@ -15,6 +15,8 @@ with faster-whisper. Zero network/cloud use at runtime.
   red `● MM:SS` while recording, click for the start/stop panel
 - `systemd/meet-recorder-watch.service` — user service running `meet-recorder watch`
   (auto-records Teams calls; enabled under graphical-session.target)
+- `pipewire/50-meet-recorder-aec.conf` — echo-cancelled mic for the recorder
+  (installed to `~/.config/pipewire/pipewire.conf.d/`)
 - `RECORDINGS.md` — installed as `~/Recordings/README.md`; documents the output layout
 - `install-local.sh` — syncs this repo to the installed locations
 
@@ -44,6 +46,13 @@ rmdir'd only when empty; dry-run is the default.
    VPS bare repo (`vps-repo:/srv/meet-recorder.git`, remote `vps`), whose
    post-receive hook mirrors `master` to GitHub automatically. If you clone
    fresh, clone from GitHub.
+6. **No audible tests, ever.** Never play sound to a real sink (pw-play,
+   paplay, aplay, ffplay, speaker-test…): the user is at the desk. Only
+   silent checks: pw-dump / wpctl / pactl inspection, recording (capture
+   only), null sinks. Do not load/unload PipeWire modules or restart
+   PipeWire while a call is live (`session.json` exists or Teams holds the mic).
+7. **The AEC source must never become the default source** nor be spliced
+   into other apps' mic path (see "Echo-cancelled mic" below).
 
 ## Test
 
@@ -79,6 +88,53 @@ rmdir'd only when empty; dry-run is the default.
   `transcribing/` (job markers), `last.json`, `watch.json` (daemon heartbeat).
 - Default whisper model is `small` (~25x realtime on this CPU). `medium` is
   more accurate and still practical; set `[whisper] model` in config.ini.
+
+## Echo-cancelled mic (2026-11-24)
+
+- Why: on speakers the mic hears the far side; me.m4a and the mix carried
+  an echo and whisper sometimes gave their words to "Me" (merge_speakers
+  only drops part of it). Priority: transcription accuracy over speed.
+- `pipewire/50-meet-recorder-aec.conf` (pipewire.conf.d drop-in, installed
+  by install-local.sh, which never restarts PipeWire) loads
+  `libpipewire-module-echo-cancel`, `library.name = aec/libspa-aec-webrtc`,
+  `monitor.mode = true`. Nodes: `meet-recorder.aec-capture` (stream from the
+  mic), `meet-recorder.aec-reference` (stream capturing the sink monitor),
+  `meet-recorder.aec-mic` (the Audio/Source we record).
+- Following devices: the docs say monitor.mode "captures from the monitor
+  ports of the default sink"; the module sets `stream.capture.sink` on that
+  stream (seen in the .so) and gives neither stream a target, so WirePlumber
+  links (and re-links on change) to the default sink / default source, the
+  same mechanism our own recorders rely on. Not yet proven live with a
+  mid-call swap.
+- Never default (WirePlumber 0.5 `default-nodes/find-best-default-node.lua`):
+  the highest `priority.session` (falls back to `priority.driver`) among
+  Audio/Source nodes wins unless the user configured a default.
+  `priority.session = priority.driver = 1` loses to every ALSA mic (~2000).
+  Only if NO real mic exists could it win; then its capture cannot link to
+  itself (same `node.link-group`), so apps get silence, same as no mic.
+  It is deliberately NOT a smart filter: `filter.smart` hides a node from the
+  default choice, but an enabled one is spliced into every app's mic
+  link (Teams would get our AEC), and a disabled one has its own streams
+  unlinked. It still shows up in mic pickers (pulse has no "hidden"); just
+  don't pick it in Teams.
+- `node.passive = true` on both streams so the mic is not held open (and
+  WebRTC not running) all day; the source idles SUSPENDED until recorded.
+  UNVERIFIED that a passive capture still delivers audio when only our
+  pw-record pulls the AEC source -> hence the fallback below.
+- Recorder: `[audio] mic_source = auto|raw|<node.name>` (`pick_mic_source`,
+  pure, over `pactl -f json list sources`). `auto` = AEC source if present
+  in state RUNNING/IDLE/SUSPENDED, unless the call app uses a non-default
+  mic (AEC follows the default mic only -> raw pinned mic). With AEC, start
+  spawns a THIRD pw-record on the raw default mic (`mic-raw.wav`); the
+  session needs the speaker recorder plus at least one mic recorder alive.
+  `finalize_audio` -> `choose_mic_wav` -> `pick_mic_track` over `wav_stats`
+  (duration, 16-bit peak): AEC track unless missing, digital silence (peak
+  <= 2) while raw is not, or < half the raw length (stalled). All WAVs are
+  deleted after the mix. meta.json `mic_echo_cancel` = the mix/me.m4a used
+  the AEC track. AEC can never fail or silence a recording.
+- Whisper: `[whisper] initial_prompt` (raw read, `%` ok; blank = none),
+  `beam_size` (>= 1), `condition_on_previous_text` -> `whisper_options`,
+  validated before the model loads, same options for both tracks.
 
 ## FocusTime export
 
@@ -300,8 +356,9 @@ rmdir'd only when empty; dry-run is the default.
 - The Teams match was verified with a simulated mic client, not yet with a
   real Teams call. If a real call does not trigger, run
   `pactl list source-outputs` during the call and adjust `[auto] apps`.
-- With speakers (not headphones) the mic also hears the far side, so the mix
-  has a slight echo of it. Transcripts are fine.
+- With speakers (not headphones) the mic also hears the far side. Fixed by
+  the echo-cancelled mic (above) once the drop-in is active; without it the
+  mix has a slight echo and merge_speakers drops only part of it.
 
 - VAD hallucinates on sparse/short audio — a few seconds of speech may
   transcribe to nonsense. Continuous meeting audio is fine.

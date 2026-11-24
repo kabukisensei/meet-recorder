@@ -2,12 +2,25 @@
 sys_volume = 1.0
 mic_volume = 2.0
 sample_rate = 16000
+# Which source the "Me" track records:
+#   auto  - the echo-cancelled mic (meet-recorder.aec-mic, from
+#           pipewire/50-meet-recorder-aec.conf) when it is loaded, else the
+#           default mic. With speakers this removes the far side from me.m4a.
+#   raw   - always the default mic (the old behaviour).
+#   <node.name> - a specific PipeWire source.
+mic_source = auto
 
 [whisper]
 model = small
 device = cpu
 compute_type = int8
 beam_size = 5
+# Vocabulary/context given to whisper for both tracks: names, product and
+# team terms it would otherwise misspell. Keep it to one short line.
+initial_prompt = Tanner, FocusTime, Omarchy, SER9, Hyprland, PipeWire
+# Feed the previous text back as context (better continuity; set false if a
+# transcript ever gets stuck repeating a phrase).
+condition_on_previous_text = true
 
 [paths]
 output_dir = ~/Recordings

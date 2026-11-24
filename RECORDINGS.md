@@ -21,7 +21,9 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
         ├── segments.json               every utterance with exact float start/end,
         │                               speaker ("Me", "Others" or "") and text
         ├── meta.json                   start time, source, title, devices, model, status,
-        │                               "screens": number of screen frames kept
+        │                               "screens": number of screen frames kept,
+        │                               "mic_echo_cancel": true if me.m4a is the
+        │                               echo-cancelled mic (far side removed)
         ├── screens/                    JPEGs of the Teams window, one per screen change
         │                               (e.g. a new slide), named by offset: 00123.4s.jpg
         ├── screens.json                [{"t": seconds, "file", "window_title", "w", "h"}]
@@ -64,7 +66,11 @@ the audio.
   e.g. `101502-teams-weekly-ops-sync`.
 - Speaker labels: `Me` is whatever your microphone picked up, `Others` is the
   call audio. Individual participants are not told apart or named. When the
-  call plays through speakers, the mic's echo of the others is filtered out.
+  call plays through speakers, the mic is recorded through PipeWire echo
+  cancellation (`mic_echo_cancel: true` in meta.json), and whatever echo is
+  left is filtered out of the transcript. Recordings from before 2026-11-24,
+  or made while echo cancellation was not loaded, have
+  `mic_echo_cancel: false` or no such field.
 - Folders from before 2026-11-23 12:00 are named `HHMMSS-meeting`, have no `meta.json`,
   and their transcripts have no speaker labels.
 

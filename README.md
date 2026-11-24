@@ -90,12 +90,15 @@ defaults:
 sys_volume = 1.0       # gain applied to system/meeting track
 mic_volume = 2.0       # gain applied to mic track
 sample_rate = 16000    # capture + mix sample rate (Hz)
+mic_source = auto      # auto | raw | <PipeWire node.name> (see below)
 
 [whisper]
-model = base           # faster-whisper model size
+model = small          # faster-whisper model size
 device = cpu
 compute_type = int8
 beam_size = 5
+initial_prompt =       # vocabulary/context line: names, product terms
+condition_on_previous_text = true
 
 [paths]
 output_dir = ~/Recordings
@@ -103,6 +106,23 @@ output_dir = ~/Recordings
 
 Edit it to taste; a partial file is merged over the defaults, so you only need
 to list the keys you want to change. `~` in paths is expanded.
+
+### Echo-free mic track
+
+With speakers, the mic also hears the far side. `pipewire/50-meet-recorder-aec.conf`
+(installed by `install-local.sh` to `~/.config/pipewire/pipewire.conf.d/`) adds an
+echo-cancelled copy of the default mic, `meet-recorder.aec-mic`, using the
+monitor of the default sink as the echo reference. It is used only by the
+recorder. It never becomes the default source, so Teams keeps the raw mic and
+does its own echo cancellation. The drop-in takes effect after the next login, or after
+`systemctl --user restart pipewire pipewire-pulse wireplumber` (not during a
+call). With `mic_source = auto` the recorder uses it when it is loaded. It also
+records the raw mic as a fallback, used if the echo-cancelled track turns out
+silent or stalled. Otherwise it records the default mic as before. `meta.json`
+says which one was used (`mic_echo_cancel`).
+
+`[whisper] initial_prompt` gives whisper a vocabulary line (names, product
+terms) for both tracks; see `config.ini.example`.
 
 ## Development
 
