@@ -114,12 +114,26 @@ with faster-whisper. Zero network/cloud use at runtime.
 - `grim -T <stableId> out.png` captures ONE window by its Hyprland `stableId`
   (`hyprctl clients -j`), **even when its workspace is not visible**. That is
   what makes this work without recording video. Teams class: `teams-for-linux`.
-- `start` spawns a detached hidden `screens-loop <raw-dir>` (if `[screens]
-  enabled`, default true); its pid is `screens_pid` in session.json (NOT in
-  `pids`, so a lingering loop never makes the session look live). `stop`
-  terminates it together with the recorders (same SIGINT→wait→SIGKILL). The
-  loop also exits by itself when the raw dir is gone or session.json no
-  longer names its raw dir (2 ticks in a row), so it cannot orphan.
+- `start` spawns a detached hidden `screens-loop <raw-dir> <session-id>
+  <origin>` (if `[screens] enabled`, default true); it leads its own
+  process group. Its pid + kernel start time are `screens_pid` /
+  `screens_start` in session.json (NOT in `pids`, so a lingering loop never
+  makes the session look live). Frame offsets are `time.monotonic() -
+  origin`; origin is taken right before pw-record starts (after the slow
+  device probes), wall time only names the folder.
+- The loop exits by itself (checked every ~1 s, 3 misses) when its raw dir
+  is gone, session.json no longer has its `id`, or no audio recorder is
+  alive any more. hyprctl/grim run one at a time with hard timeouts (5 s /
+  10 s) in the worker's process group; SIGTERM kills the running one at once.
+  Full frames come from `grim … -` (stdout) and are written by us 0600, so
+  there are never grim-made partial files.
+- Disk: a frame is skipped (logged) past `max_mb` (300) of frames or when the
+  disk would drop below `min_free_mb` (1024, the WAVs share the disk).
+  screens.log is best effort and stops growing at 256 KiB. A keep only
+  counts after the JPEG and its manifest line are both written (the line is
+  one append; a short write is truncated away).
+- Privacy: the raw session dir (WAVs + frames) and `<folder>/screens/` are
+  0700; frames, screens.jsonl, screens.log, screens.json are 0600.
 - Each tick (`interval_seconds`, 3): `hyprctl clients -j` → pick the window
   (`pick_screen_window`: class substring, mapped, meeting-like title, else
   largest) → `grim -T id -s <scale> -t ppm -` thumbnail 200 logical px wide
@@ -149,18 +163,50 @@ with faster-whisper. Zero network/cloud use at runtime.
   compositor), so any per-cell value only has to beat animation. A changed
   text line moves its cells by ~0.1–0.5 (18 of 108 calm cells in the test
   slide); a caret-sized change touches one cell (<1 %) and is ignored.
-- Kept: full-res `grim -T id -t jpeg -q 80` → `<raw>/screens/00123.4s.jpg`
+- Kept: full-res `grim -T id -t jpeg -q 80 -` → `<raw>/screens/00123.4s.jpg`
   (offset from start, sortable) + a line in `<raw>/screens.jsonl`. Errors
   go to `<raw>/screens.log` (deduplicated), never crash the loop. The loop
   runs at nice 10.
 - Cost: one grab ≈ 20–30 ms of grim; the loop averages well under 1 % of a
   core (see the commit's live proof).
-- `finalize_audio` moves frames to `<folder>/screens/`, writes `screens.json`
-  (array, tolerant of a torn last jsonl line) and `meta.json "screens": N`
-  before deleting the raw dir. A screens failure never costs the audio.
-- `transcribe` writes `moments.md` after the transcripts (frame image + the
-  segments overlapping [t-30 s, t+15 s], from the precise segment times);
-  rebuild with `meet-recorder moments <folder>`.
+- `finalize_audio` only mixes audio and deletes the WAVs; `stop` then spawns
+  `transcribe` AND a separate detached `collect-screens <raw> <folder>` job,
+  so slow storage never delays the audio or the transcription. The collector
+  copies each frame (verified size, 0600), publishes `screens.json` listing
+  exactly the verified copies, merges `"screens": N` into meta.json, and
+  deletes the raw dir only if every copy succeeded (otherwise re-run it).
+  meta.json is merged under a folder flock (`update_meta`) by both jobs;
+  transcript.md/.txt are now written atomically.
+- `moments.md` (frame image + the segments overlapping [t-30 s, t+15 s]) is
+  written by whichever of transcribe / collect-screens finishes last
+  (`moments_if_ready`, under the folder lock); rebuild with
+  `meet-recorder moments <folder>`. If collection finishes after the summary
+  ran, re-run `meet-recorder link-screens <folder>`.
+- `link-screens` only treats a `[mm:ss]` / `[h:mm:ss]` that ENDS the line
+  (optional `.`, not a Markdown link) as a tag; `read_frames` only returns
+  manifest entries with a finite `t`, a `NNNNN.Ns.jpg` basename and an
+  existing file.
+
+## Session lifecycle (2026-11-23 fix round)
+
+- `start`, `stop`, `toggle` and the watcher's stale-session recovery all run
+  under `flock(~/.local/state/meet-recorder/lock)` (`lifecycle_lock`,
+  re-entrant in-process, "busy" after 120 s). `start` publishes session.json
+  ONCE, complete (recorders verified, worker attached, unique `id`),
+  atomically, 0600. `stop` signals + clears state under the lock, then mixes
+  outside it.
+- Process identity: session.json stores each pid's kernel start time
+  (`pid_starts`, `screens_start`; /proc/<pid>/stat field 22). A pid whose
+  start time differs (PID reuse) or that is a zombie is dead; signals go via
+  pidfd after the identity check. Signalling errors are printed, never
+  raised, so finalization always runs.
+- `stop_procs`: recorders SIGINT, worker group SIGTERM, wait 5 s, SIGKILL
+  survivors (group included). The watcher reaps its children every poll and
+  recovers a session whose recorders died as soon as it notices.
+- `meet-recorder auto on|off` rewrites only `[auto] enabled` in config.ini
+  (it used to freeze every default into the file).
+- `meet-recorder latest` prints the newest folder with a transcript.md under
+  `[paths] output_dir`; the summarizer's no-argument mode uses it.
 - `meet-recorder-summarize` lives in this repo now (installed by
   install-local.sh). Its prompt asks for `[mm:ss]` at the end of each action
   item / decision; afterwards it runs `meet-recorder link-screens <folder>`,

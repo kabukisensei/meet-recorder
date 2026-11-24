@@ -31,13 +31,19 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
         │                               decisions end in [mm:ss] and link the screen
         │                               that was showing then
         ├── screens.log                 capture errors (only if something went wrong)
+        ├── collect.log                 screen-copy errors (only if something went wrong)
         └── transcribe.log              transcription log (only useful if something failed)
 ```
 
 Screen frames are only kept when the window content changes and then holds
-still for a few seconds (slides, shared documents); live camera video never
-holds still, so camera-only stretches produce no frames. The `screens/`,
-`screens.json` and `moments.md` entries are absent when nothing was kept.
+still for a few seconds (slides, shared documents). Areas that keep moving
+(live camera tiles beside a shared slide) are ignored, so a slide is still
+captured while people are on camera; a window that is almost all live video
+produces no frames. The `screens/`, `screens.json` and `moments.md` entries
+are absent when nothing was kept. Screenshots are private to your user
+(`screens/` is 0700, the images 0600). They are copied in by a separate job
+right after the recording is saved, so they can appear a few seconds after
+the audio.
 
 - `<source>` is `teams` (started automatically when a Teams call began) or
   `manual` (started from the bar icon or Super+Shift+R).

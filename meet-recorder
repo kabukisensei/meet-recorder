@@ -7,6 +7,9 @@ network calls, ever. faster-whisper is imported lazily, only at transcribe time.
 """
 
 import configparser
+import contextlib
+import fcntl
+import io
 import json
 import math
 import operator
@@ -29,6 +32,7 @@ CONFIG_FILE = os.path.expanduser(os.environ.get("MEET_RECORDER_CONFIG")
 JOBS_DIR = os.path.join(STATE_DIR, "transcribing")   # one marker per running job
 LAST_FILE = os.path.join(STATE_DIR, "last.json")     # most recent finished session
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")   # heartbeat of the auto-recorder
+LOCK_FILE = os.path.join(STATE_DIR, "lock")          # serializes start/stop
 
 DEFAULTS = {
     "audio": {"sys_volume": "1.0", "mic_volume": "2.0", "sample_rate": "16000"},
@@ -620,7 +624,12 @@ def render_moments(frames, segments):
     return "\n".join(out)
 
 
-_SUMMARY_TS = re.compile(r"\[(?:(\d+):)?(\d+):([0-5]\d)\]")
+# The tag the summary prompt asks for: '[mm:ss]' or '[h:mm:ss]' as the LAST
+# thing on the line (an optional final '.'), not followed by '(' -- so a
+# Markdown link like '[01:45](#t)' or a mid-line time is never a tag.
+_SUMMARY_TS = re.compile(r"\[(?:(\d+):)?(\d+):([0-5]\d)\](?!\()\.?\s*$")
+# What link_screens appends; a line already ending in it is left alone.
+_SCREEN_LINK = re.compile(r" — \[screen \d+:\d\d\]\(screens/[0-9]+\.[0-9]s\.jpg\)\s*$")
 
 
 def pick_frame(frames, t, before=90.0, after=15.0):
@@ -634,16 +643,16 @@ def pick_frame(frames, t, before=90.0, after=15.0):
 
 
 def link_screens(text, frames):
-    """Append a screen link to each summary line ending in a '[mm:ss]'
-    reference that has a frame nearby (pick_frame). Idempotent: lines that
-    already link a screen are left alone."""
+    """Append a screen link to each summary line ending in a '[mm:ss]' tag
+    that has a frame nearby (pick_frame). Idempotent: a line already ending
+    in the generated link is left alone."""
     out = []
     for line in text.splitlines(keepends=True):
         body = line.rstrip("\r\n")
         nl = line[len(body):]
-        refs = list(_SUMMARY_TS.finditer(body))
-        if refs and "](screens/" not in body:
-            h, m, s = refs[-1].groups()
+        ref = _SUMMARY_TS.search(body)
+        if ref and not _SCREEN_LINK.search(body):
+            h, m, s = ref.groups()
             f = pick_frame(frames, int(h or 0) * 3600 + int(m) * 60 + int(s))
             if f:
                 body = (body.rstrip() + f" — [screen {fmt_ts(f['t'])}]"
@@ -662,6 +671,12 @@ def load_config(path=None):
     cfg.read_dict(DEFAULTS)
     cfg.read(os.path.expanduser(path or CONFIG_FILE))
     return cfg
+
+
+def config_text(cfg):
+    buf = io.StringIO()
+    cfg.write(buf)
+    return buf.getvalue()
 
 
 def speaker_names(cfg):
@@ -694,9 +709,9 @@ def build_ffmpeg_mix_cmd(sys_wav, mic_wav, out_path,
 # State / process helpers
 # --------------------------------------------------------------------------- #
 
-def ensure_config(path=CONFIG_FILE):
+def ensure_config(path=None):
     """Create the config file with defaults on first run, then load it."""
-    path = os.path.expanduser(path)
+    path = os.path.expanduser(path or CONFIG_FILE)
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cfg = configparser.ConfigParser()
@@ -707,17 +722,13 @@ def ensure_config(path=CONFIG_FILE):
 
 
 def read_state():
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+    state = read_json(STATE_FILE)
+    return state if isinstance(state, dict) else None
 
 
 def write_state(state):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+    """Publish session.json atomically (a reader never sees half a state)."""
+    write_json(STATE_FILE, state, private=True)
 
 
 def clear_state():
@@ -727,37 +738,191 @@ def clear_state():
         pass
 
 
-def pid_alive(pid):
+@contextlib.contextmanager
+def flock_path(path, timeout=120.0):
+    """Exclusive flock on path (a file, created 0600, or a directory) for
+    the duration of the with-block. Raises TimeoutError after timeout s."""
+    if os.path.isdir(path):
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{path} is locked by another process")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)        # releases the lock
+
+
+_lifecycle_depth = [0]
+# How long start/stop wait for another transition (a stop mixing nothing
+# but signals, a start's device probes) before reporting "busy".
+LOCK_TIMEOUT = 120.0
+
+
+@contextlib.contextmanager
+def lifecycle_lock(timeout=None):
+    """Serialize session transitions (start / stop / toggle / stale recovery,
+    manual or from the watcher) across processes. Re-entrant within one
+    process (toggle -> stop, start -> recover_stale)."""
+    if _lifecycle_depth[0]:
+        _lifecycle_depth[0] += 1
+        try:
+            yield
+        finally:
+            _lifecycle_depth[0] -= 1
+        return
+    with flock_path(LOCK_FILE, LOCK_TIMEOUT if timeout is None else timeout):
+        _lifecycle_depth[0] = 1
+        try:
+            yield
+        finally:
+            _lifecycle_depth[0] = 0
+
+
+def proc_stat(pid):
+    """(state letter, process group, start time in clock ticks since boot)
+    of a pid from /proc, or None if there is no such process."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            data = f.read()
+        rest = data[data.rindex(b")") + 2:].split()
+        return rest[0].decode(), int(rest[2]), int(rest[19])
+    except (OSError, ValueError, TypeError, IndexError):
+        return None
+
+
+def proc_start(pid):
+    st = proc_stat(pid)
+    return st[2] if st else None
+
+
+def pid_alive(pid, start=None):
+    """True if pid is a running (non-zombie) process and, when start is
+    given, still the same process (same kernel start time: no PID reuse)."""
+    st = proc_stat(pid)
+    if st is None or st[0] in ("Z", "X"):
         return False
-    except PermissionError:
-        return True
-    return True
+    return start is None or st[2] == start
+
+
+def reap(pids=None):
+    """Collect exited children (all, or the given pids) so they do not
+    linger as zombies; a no-op for processes that are not our children."""
+    for pid in ([-1] if pids is None else pids):
+        while True:
+            try:
+                got, _ = os.waitpid(pid, os.WNOHANG)
+            except (ChildProcessError, OSError):
+                break
+            if not got or pid != -1:
+                break
+
+
+def state_procs(state):
+    """[(pid, start)] of a session's audio recorders (start None for
+    states written before identities were recorded)."""
+    starts = (state or {}).get("pid_starts") or {}
+    return [(p, starts.get(str(p))) for p in (state or {}).get("pids", [])
+            if isinstance(p, int)]
+
+
+def screens_proc(state):
+    pid = (state or {}).get("screens_pid")
+    return (pid, state.get("screens_start")) if isinstance(pid, int) else None
 
 
 def session_live(state):
-    return bool(state) and any(pid_alive(p) for p in state.get("pids", []))
+    return bool(state) and any(pid_alive(p, s) for p, s in state_procs(state))
 
 
-def terminate(pids, timeout=5.0):
-    """SIGINT the pids, wait up to timeout, then SIGKILL survivors."""
-    for pid in pids:
-        if pid_alive(pid):
-            try:
-                os.kill(pid, signal.SIGINT)
-            except ProcessLookupError:
-                pass
-    deadline = time.time() + timeout
-    while time.time() < deadline and any(pid_alive(p) for p in pids):
+def send_signal(proc, sig, group=False):
+    """Signal (pid, start) only if it is still that process. Uses a pidfd
+    where possible so the identity check and the signal hit the same
+    process; group=True signals its whole process group instead (the
+    process leads one). Returns True if sent. Never raises."""
+    pid, start = proc
+    fd = None
+    try:
+        try:
+            fd = os.pidfd_open(pid)
+        except (AttributeError, OSError):
+            fd = None
+        if not pid_alive(pid, start):
+            return False
+        if group:
+            os.killpg(pid, sig)
+        elif fd is not None:
+            signal.pidfd_send_signal(fd, sig)
+        else:
+            os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError as e:
+        print(f"cannot signal pid {pid}: {e}", file=sys.stderr)
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def group_alive(pgid):
+    """True while any non-zombie process is in process group pgid."""
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return False
+    for name in names:
+        if name.isdigit():
+            st = proc_stat(name)
+            if st and st[1] == pgid and st[0] not in ("Z", "X"):
+                return True
+    return False
+
+
+def stop_procs(recorders, worker=None, timeout=5.0):
+    """Stop a session's processes; bounded and never raises.
+
+    recorders: [(pid, start)] get SIGINT (pw-record finalizes the WAV).
+    worker: (pid, start) of screens-loop gets SIGTERM to its whole process
+    group, so a grim/hyprctl it is waiting on dies with it. Anything still
+    alive after timeout gets SIGKILL (the group too). Processes whose
+    identity no longer matches (exited, PID reused) are never signalled.
+    """
+    group = None
+    if worker and send_signal(worker, signal.SIGTERM, group=True):
+        group = worker[0]
+    live = [p for p in recorders if send_signal(p, signal.SIGINT)]
+    ours = [p for p, _ in live] + ([group] if group else [])
+    deadline = time.monotonic() + timeout
+    while True:
+        reap(ours)
+        live = [p for p in live if pid_alive(*p)]
+        if group and not group_alive(group):
+            group = None
+        if not live and not group:
+            return
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.1)
-    for pid in pids:
-        if pid_alive(pid):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+    for p in live:
+        send_signal(p, signal.SIGKILL)
+    if group:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.1)
+    reap(ours)
 
 
 def notify(title, body=""):
@@ -771,9 +936,10 @@ def notify(title, body=""):
 # Environment probes (PipeWire / Hyprland)
 # --------------------------------------------------------------------------- #
 
-def run_json(argv, default):
+def run_json(argv, default, env=None):
     try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=5,
+                             env=env, stdin=subprocess.DEVNULL)
         return json.loads(out.stdout) if out.returncode == 0 else default
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return default
@@ -807,14 +973,18 @@ def hypr_env(env=None):
     env["XDG_RUNTIME_DIR"] = runtime
     if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
         base = os.path.join(runtime, "hypr")
+        sigs = []
         try:
-            sigs = [d for d in os.listdir(base) if os.path.exists(
-                os.path.join(base, d, ".socket.sock"))]
+            for d in os.listdir(base):
+                try:         # an instance may vanish between listdir and stat
+                    if os.path.exists(os.path.join(base, d, ".socket.sock")):
+                        sigs.append((os.path.getmtime(os.path.join(base, d)), d))
+                except OSError:
+                    pass
         except OSError:
-            sigs = []
+            pass
         if sigs:
-            env["HYPRLAND_INSTANCE_SIGNATURE"] = max(
-                sigs, key=lambda d: os.path.getmtime(os.path.join(base, d)))
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = max(sigs)[1]
     if not env.get("WAYLAND_DISPLAY"):
         try:
             socks = sorted(n for n in os.listdir(runtime)
@@ -887,6 +1057,26 @@ def write_json(path, data, private=False):
     write_text_atomic(path, json.dumps(data, indent=1), private)
 
 
+def make_private_dir(path):
+    """mkdir -p path with mode 0700 (also tightening an existing one)."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def update_meta(folder, fields):
+    """Merge fields into <folder>/meta.json under a lock on the folder, so
+    the transcriber and the screens collector never drop each other's keys."""
+    path = os.path.join(folder, "meta.json")
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"not a folder: {folder}")
+    with flock_path(folder):
+        meta = read_json(path)
+        meta = meta if isinstance(meta, dict) else {}
+        meta.update(fields)
+        write_json(path, meta)
+    return meta
+
+
 def active_jobs():
     """Folders currently being transcribed (drops markers of dead jobs)."""
     jobs = []
@@ -915,6 +1105,18 @@ def cmd_start(args=(), source="manual"):
     cfg = ensure_config()
     if "--auto" in args:
         source = "teams"
+    try:
+        with lifecycle_lock():
+            return start_locked(cfg, source)
+    except TimeoutError as e:
+        print(f"busy: {e}", file=sys.stderr)
+        return 1
+
+
+def start_locked(cfg, source):
+    """cmd_start body; runs under lifecycle_lock. session.json is published
+    once, complete (recorders verified, screens worker attached), so no
+    other start/stop/watcher can see or clobber a half-made session."""
     state = read_state()
     if state is not None:
         if session_live(state):
@@ -928,12 +1130,6 @@ def cmd_start(args=(), source="manual"):
         ["pactl", "get-default-source"], text=True).strip()
 
     rate = cfg.get("audio", "sample_rate")
-    start_unix = int(time.time())
-    sess_dir = os.path.join(CACHE_DIR, str(start_unix))
-    os.makedirs(sess_dir, exist_ok=True)
-    sys_wav = os.path.join(sess_dir, "sys.wav")
-    mic_wav = os.path.join(sess_dir, "mic.wav")
-
     # start_new_session: the recorders must outlive whatever launched us
     # (keybind shell, bar widget, the watch daemon being restarted).
     quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -953,31 +1149,50 @@ def cmd_start(args=(), source="manual"):
         run_json(["pactl", "-f", "json", "list", "sources"], []),
         apps, "source", mic)
     sink, mic = pin_sink or sink, pin_mic or mic
+    title = meeting_title(cfg)
+
+    # Unique per session: the raw dir and the id the screens worker checks.
+    session_id = f"{int(time.time())}-{os.urandom(3).hex()}"
+    sess_dir = os.path.join(CACHE_DIR, session_id)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    make_private_dir(sess_dir)          # call audio + screenshots: 0700
+    sys_wav = os.path.join(sess_dir, "sys.wav")
+    mic_wav = os.path.join(sess_dir, "mic.wav")
     base = ["pw-record", "--channels", "1", "--rate", rate]
+    # Taken immediately before audio starts (after all the slow probes):
+    # wall time names the folder, the monotonic origin times the frames.
+    start_unix, origin = int(time.time()), time.monotonic()
     p_sys = subprocess.Popen(
         base + ["-P", "{ stream.capture.sink = true }"]
         + (["--target", pin_sink] if pin_sink else []) + [sys_wav], **quiet)
     p_mic = subprocess.Popen(
         base + (["--target", pin_mic] if pin_mic else []) + [mic_wav], **quiet)
-    title = meeting_title(cfg)
-    write_state({"pids": [p_sys.pid, p_mic.pid], "start": start_unix,
-                 "session_dir": sess_dir, "sys_wav": sys_wav, "mic_wav": mic_wav,
-                 "source": source, "title": title, "sink": sink, "mic": mic})
+    procs = [(p.pid, proc_start(p.pid)) for p in (p_sys, p_mic)]
     time.sleep(0.4)
-    if not (pid_alive(p_sys.pid) and p_sys.poll() is None
-            and pid_alive(p_mic.pid) and p_mic.poll() is None):
-        terminate([p_sys.pid, p_mic.pid], timeout=1)
-        clear_state()
+    if not (p_sys.poll() is None and p_mic.poll() is None):
+        stop_procs(procs, timeout=1)
+        shutil.rmtree(sess_dir, ignore_errors=True)
         notify("Meeting recorder: could not start",
                "pw-record failed to open the speaker or microphone.")
         print("failed to start recorders", file=sys.stderr)
         return 1
+    state = {"id": session_id, "pids": [p for p, _ in procs],
+             "pid_starts": {str(p): s for p, s in procs},
+             "start": start_unix, "origin": origin,
+             "session_dir": sess_dir, "sys_wav": sys_wav, "mic_wav": mic_wav,
+             "source": source, "title": title, "sink": sink, "mic": mic}
     if screens_enabled(cfg):
-        screens_pid = spawn_screens(sess_dir)
-        if screens_pid:
-            state = read_state() or {}
-            state["screens_pid"] = screens_pid
-            write_state(state)
+        worker = spawn_screens(sess_dir, session_id, origin)
+        if worker:
+            state["screens_pid"], state["screens_start"] = worker
+    try:
+        write_state(state)
+    except OSError as e:     # untracked recorders must not keep running
+        stop_procs(procs, screens_proc(state), timeout=1)
+        shutil.rmtree(sess_dir, ignore_errors=True)
+        notify("Meeting recorder: could not start", str(e))
+        print(f"cannot write session state: {e}", file=sys.stderr)
+        return 1
     notify("● Recording started",
            (title or ("Teams call" if source == "teams" else "Manual recording"))
            + "\nStop: click the mic icon in the bar, or Super+Shift+R")
@@ -1031,13 +1246,14 @@ def write_transcripts(folder, segments, start_unix, duration, title="",
     """
     lines = [format_segment(*seg) for seg in segments]
     body = "\n".join(lines) + ("\n" if lines else "")
-    with open(os.path.join(folder, "transcript.txt"), "w") as f:
-        f.write(body)
+    # Atomic, so the screens collector building moments.md concurrently
+    # never parses half a transcript.
+    write_text_atomic(os.path.join(folder, "transcript.txt"), body)
     iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start_unix))
-    with open(os.path.join(folder, "transcript.md"), "w") as f:
-        f.write(f"# {title or 'Meeting'} {iso}\n\n")
-        f.write(f"Duration: {fmt_ts(duration)}\n\n")
-        f.write(body if body else MD_NO_SPEECH + "\n")
+    write_text_atomic(os.path.join(folder, "transcript.md"),
+                      f"# {title or 'Meeting'} {iso}\n\n"
+                      f"Duration: {fmt_ts(duration)}\n\n"
+                      + (body if body else MD_NO_SPEECH + "\n"))
     seg_path = os.path.join(folder, "segments.json")
     try:
         seg_dicts = segment_dicts(segments)
@@ -1095,9 +1311,21 @@ def finalize_audio(state, cfg):
                             "48k", os.path.join(folder, name)],
                            check=False, **quiet)
 
-    n_screens = collect_screens(sess_dir, folder)
-    # Raw WAVs are disposable once the mix succeeds.
-    shutil.rmtree(sess_dir, ignore_errors=True)
+    # Raw WAVs are disposable once the mix succeeds. Screen frames stay in
+    # the raw dir: a separate collect-screens job owns them from here on,
+    # so slow storage never delays the audio or the transcription.
+    for wav in (sys_wav, mic_wav):
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
+    n_screens = len(read_screens_jsonl(sess_dir))
+    try:
+        has_log = os.path.getsize(os.path.join(sess_dir, "screens.log")) > 0
+    except OSError:
+        has_log = False
+    if not n_screens and not has_log:
+        shutil.rmtree(sess_dir, ignore_errors=True)
 
     write_json(os.path.join(folder, "meta.json"), {
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z",
@@ -1116,57 +1344,159 @@ def finalize_audio(state, cfg):
 def read_screens_jsonl(raw_dir):
     """Frames recorded by screens-loop whose image exists, sorted by t.
     Tolerates a torn last line (the loop may be killed mid-write)."""
-    frames = []
     try:
-        with open(os.path.join(raw_dir, "screens.jsonl"), encoding="utf-8") as f:
+        with open(os.path.join(raw_dir, "screens.jsonl"), encoding="utf-8",
+                  errors="replace") as f:
             lines = f.readlines()
     except OSError:
-        return frames
+        return []
+    out = []
     for line in lines:
         try:
             d = json.loads(line)
-            float(d["t"])
-        except (ValueError, KeyError, TypeError):
+        except ValueError:
             continue
-        if (isinstance(d.get("file"), str) and "/" not in d["file"]
-                and os.path.isfile(os.path.join(raw_dir, "screens", d["file"]))):
-            frames.append(d)
-    return sorted(frames, key=lambda d: d["t"])
+        if (valid_frame(d) and os.path.isfile(
+                os.path.join(raw_dir, "screens", d["file"]))):
+            out.append(d)
+    return sorted(out, key=lambda d: d["t"])
+
+
+_FRAME_FILE = re.compile(r"[0-9]+\.[0-9]s\.jpg")
+
+
+def valid_frame(d):
+    """A manifest entry with a finite offset and a frame file name of our
+    own shape (a bare basename: never a path, never another file type)."""
+    return (isinstance(d, dict) and isinstance(d.get("file"), str)
+            and _FRAME_FILE.fullmatch(d["file"]) is not None
+            and isinstance(d.get("t"), (int, float))
+            and not isinstance(d.get("t"), bool) and math.isfinite(d["t"]))
+
+
+def append_private(path, text):
+    """Append one record to a 0600 file in a single write; a partial write
+    (disk full) is truncated away so the next record starts clean."""
+    data = text.encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC,
+                 0o600)
+    try:
+        size = os.fstat(fd).st_size
+        try:
+            if os.write(fd, data) != len(data):
+                raise OSError(28, "short write")
+        except OSError:
+            try:
+                os.ftruncate(fd, size)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(fd)
 
 
 def collect_screens(raw_dir, folder):
-    """Move kept frames into <folder>/screens/ and write screens.json.
-    Returns the frame count; never raises (screens must not cost audio)."""
+    """Copy the kept frames from a raw session dir into <folder>/screens/
+    (dir 0700, files 0600, each verified), publish screens.json listing
+    exactly the verified copies, merge the count into meta.json, then build
+    moments.md if the transcript is already there. The raw dir is deleted
+    only when every frame was copied, so a failure can be retried with
+    `meet-recorder collect-screens <raw> <folder>`. Returns the number of
+    frames published; never raises (screens must not cost audio)."""
+    done, ok = [], True
     try:
         frames = read_screens_jsonl(raw_dir)
         if frames:
             dest = os.path.join(folder, "screens")
-            os.makedirs(dest, exist_ok=True)
+            make_private_dir(dest)
             for d in frames:
-                shutil.move(os.path.join(raw_dir, "screens", d["file"]),
-                            os.path.join(dest, d["file"]))
-            write_json(os.path.join(folder, "screens.json"), frames)
+                try:
+                    with open(os.path.join(raw_dir, "screens", d["file"]),
+                              "rb") as f:
+                        data = f.read()
+                    target = os.path.join(dest, d["file"])
+                    write_bytes_atomic(target, data, private=True)
+                    if os.path.getsize(target) != len(data):
+                        raise OSError(f"{target}: size mismatch after copy")
+                    done.append(d)
+                except OSError as e:
+                    ok = False
+                    print(f"copying {d['file']} failed: {e}", file=sys.stderr)
+            if done:
+                write_json(os.path.join(folder, "screens.json"), done,
+                           private=True)
         log = os.path.join(raw_dir, "screens.log")
         if os.path.exists(log) and os.path.getsize(log):
-            shutil.move(log, os.path.join(folder, "screens.log"))
-        return len(frames)
+            with open(log, "rb") as f:
+                write_bytes_atomic(os.path.join(folder, "screens.log"),
+                                   f.read()[-262144:], private=True)
+        if frames:
+            update_meta(folder, {"screens": len(done)})
     except Exception as e:
+        ok = False
         print(f"collecting screens failed: {e}", file=sys.stderr)
-        return 0
+    if ok:
+        shutil.rmtree(raw_dir, ignore_errors=True)
+    if done:
+        try:
+            moments_if_ready(folder)
+        except Exception as e:
+            print(f"moments.md failed: {e}", file=sys.stderr)
+    return len(done)
 
 
-def spawn_screens(sess_dir):
-    """Start the detached screens-loop for a raw session dir; pid or None."""
+def moments_if_ready(folder, segments=None):
+    """Write moments.md once both inputs exist (frames + a transcript).
+    Called by both the transcriber and the screens collector, whichever
+    finishes last; the folder lock makes the last writer see both."""
+    with flock_path(folder):
+        if not read_frames(folder):
+            return None
+        if segments is None:
+            try:
+                segments = folder_segments(folder)[0]
+            except (OSError, ValueError):
+                return None             # transcript not there (yet)
+        return write_moments(folder, segments)
+
+
+def spawn_screens(sess_dir, session_id, origin):
+    """Start the detached screens-loop (it leads its own process group);
+    returns (pid, start) or None."""
     try:
-        log = open(os.path.join(sess_dir, "screens.log"), "a")
-        p = subprocess.Popen([sys.executable, os.path.abspath(__file__),
-                              "screens-loop", sess_dir],
-                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                             start_new_session=True)
-        log.close()
-        return p.pid
+        fd = os.open(os.path.join(sess_dir, "screens.log"),
+                     os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC,
+                     0o600)
+        try:
+            p = subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                                  "screens-loop", sess_dir, session_id,
+                                  repr(origin)],
+                                 stdin=subprocess.DEVNULL, stdout=fd,
+                                 stderr=fd, start_new_session=True)
+        finally:
+            os.close(fd)
+        return p.pid, proc_start(p.pid)
     except OSError:
         return None
+
+
+def spawn_collect(raw_dir, folder):
+    """Collect screen frames in a detached job (see collect_screens)."""
+    if not os.path.isdir(raw_dir):
+        return
+    try:
+        fd = os.open(os.path.join(folder, "collect.log"),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC,
+                     0o600)
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                              "collect-screens", raw_dir, folder],
+                             stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
+                             start_new_session=True)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"cannot start collect-screens: {e}", file=sys.stderr)
 
 
 def load_folder_segments(folder):
@@ -1178,12 +1508,14 @@ def load_folder_segments(folder):
 
 
 def read_frames(folder):
-    """screens.json of a session folder ([] if missing or malformed)."""
+    """Frames listed in a session folder's screens.json that are valid
+    (valid_frame) and whose JPEG exists in <folder>/screens/; [] if the
+    manifest is missing or malformed."""
     frames = read_json(os.path.join(folder, "screens.json"))
     if not isinstance(frames, list):
         return []
-    return [f for f in frames if isinstance(f, dict)
-            and isinstance(f.get("t"), (int, float)) and isinstance(f.get("file"), str)]
+    return [f for f in frames if valid_frame(f) and os.path.isfile(
+        os.path.join(folder, "screens", f["file"]))]
 
 
 def write_moments(folder, segments):
@@ -1215,40 +1547,65 @@ def spawn_transcribe(folder):
 
 
 def recover_stale(state):
-    """A previous session died (crash/reboot) — save whatever audio it left."""
-    clear_state()
+    """A previous session died (crash/reboot/recorders killed) — stop
+    whatever is left of it (a lingering screens worker) and save the audio.
+    Call under lifecycle_lock."""
+    with lifecycle_lock():
+        clear_state()
+        stop_procs(state_procs(state), screens_proc(state), timeout=2)
+    finish_session(state, ensure_config(), recovered=True)
+
+
+def recover_if_stale():
+    """Watcher: recover a session whose recorders all died, as soon as it
+    is noticed (not only at the next start). Re-checks under the lock."""
+    with lifecycle_lock():
+        state = read_state()
+        if state is not None and not session_live(state):
+            recover_stale(state)
+
+
+def finish_session(state, cfg, recovered=False):
+    """After the processes are stopped: mix the audio, then start the
+    transcription and (separately) the screenshot collection. Returns an
+    exit code."""
     try:
-        folder = finalize_audio(state, ensure_config())
-    except Exception:
-        return
+        folder = finalize_audio(state, cfg)
+    except Exception as e:
+        if not recovered:
+            notify("Meeting recorder: saving failed", str(e))
+        print(f"saving failed: {e}", file=sys.stderr)
+        return 1
+    try:
+        write_json(LAST_FILE, {"folder": folder, "status": "transcribing"})
+    except OSError as e:
+        print(f"cannot write {LAST_FILE}: {e}", file=sys.stderr)
     spawn_transcribe(folder)
-    notify("Meeting recorder", "Recovered an interrupted recording:\n" + folder)
+    spawn_collect(state.get("session_dir", ""), folder)
+    if recovered:
+        notify("Meeting recorder", "Recovered an interrupted recording:\n" + folder)
+    else:
+        notify("Recording saved — transcribing…", folder)
+    print(folder)
+    return 0
 
 
 def cmd_stop(args=()):
     cfg = ensure_config()
-    state = read_state()
-    if state is None:
-        print("Not recording.", file=sys.stderr)
-        return 1
-    pids = list(state.get("pids", []))
-    if isinstance(state.get("screens_pid"), int):
-        pids.append(state["screens_pid"])
     try:
-        terminate(pids)
-    finally:
-        clear_state()
-    try:
-        folder = finalize_audio(state, cfg)
-    except Exception as e:
-        notify("Meeting recorder: saving failed", str(e))
-        print(f"saving failed: {e}", file=sys.stderr)
+        with lifecycle_lock():
+            state = read_state()
+            if state is None:
+                print("Not recording.", file=sys.stderr)
+                return 1
+            # Never raises: a signalling problem (PID reuse, permissions)
+            # must not cost the audio finalization below.
+            stop_procs(state_procs(state), screens_proc(state))
+            clear_state()
+    except TimeoutError as e:
+        print(f"busy: {e}", file=sys.stderr)
         return 1
-    write_json(LAST_FILE, {"folder": folder, "status": "transcribing"})
-    spawn_transcribe(folder)
-    notify("Recording saved — transcribing…", folder)
-    print(folder)
-    return 0
+    return finish_session(state, cfg)
 
 
 def cmd_transcribe(args=()):
@@ -1264,13 +1621,14 @@ def cmd_transcribe(args=()):
     marker = os.path.join(JOBS_DIR, f"{os.getpid()}.json")
     write_json(marker, {"pid": os.getpid(), "folder": folder})
     status = "failed"
+    updates = {}         # merged into meta.json at the end (update_meta)
     try:
         me_audio = os.path.join(folder, "me.m4a")
         others_audio = os.path.join(folder, "others.m4a")
         if os.path.exists(me_audio) and os.path.exists(others_audio):
             (me, d1), (others, d2) = transcribe([me_audio, others_audio], cfg)
             segments, duration = merge_speakers(me, others), max(d1, d2)
-            meta["speaker_labels"] = True
+            updates["speaker_labels"] = True
         else:
             [(segments, duration)] = transcribe([audio], cfg)
         start = os.path.getmtime(audio) - duration
@@ -1282,8 +1640,8 @@ def cmd_transcribe(args=()):
         export_err = write_transcripts(folder, segments, start, duration,
                                        meta.get("title", ""), cfg)
         status = "done" if segments else "no-speech"
-        try:
-            write_moments(folder, segment_dicts(segments))
+        try:     # frames may still be being collected; then that job does it
+            moments_if_ready(folder, segment_dicts(segments))
         except Exception as e:   # never fails the transcription
             print(f"moments.md failed: {e}\nretry: meet-recorder moments "
                   f"{folder}", file=sys.stderr)
@@ -1297,8 +1655,8 @@ def cmd_transcribe(args=()):
         summary_cmd = cfg.get("summary", "summary_cmd", fallback="").strip()
         if status == "done" and summary_cmd:
             spawn_summary(summary_cmd.format(folder=folder), folder)
-        meta.update({"duration_seconds": round(duration),
-                     "whisper_model": cfg.get("whisper", "model")})
+        updates.update({"duration_seconds": round(duration),
+                        "whisper_model": cfg.get("whisper", "model")})
         notify("Transcript ready" if segments else "Recording saved (no speech found)",
                folder)
     except Exception as e:
@@ -1306,8 +1664,8 @@ def cmd_transcribe(args=()):
                f"{e}\nAudio is safe in {folder}")
         raise
     finally:
-        meta["transcript_status"] = status
-        write_json(meta_path, meta)
+        updates["transcript_status"] = status
+        update_meta(folder, updates)
         last = read_json(LAST_FILE) or {}
         if last.get("folder") == folder:
             write_json(LAST_FILE, {"folder": folder, "status": status})
@@ -1388,118 +1746,230 @@ def folder_segments(folder):
         return parse_md_transcript(f.read(), labels), True
 
 
-def grab_thumb(stable_id, width, env):
+class CaptureRunner:
+    """Runs one capture subprocess (hyprctl / grim) at a time with a hard
+    timeout. kill() -- called from the stop signal handler -- ends the
+    running one at once. The children stay in the worker's process group,
+    which `stop` signals as a whole, so none can outlive a stop even if the
+    worker itself is SIGKILLed."""
+
+    def __init__(self, env):
+        self.env, self.proc, self.stopping = env, None, False
+
+    def run(self, argv, timeout):
+        if self.stopping:
+            raise RuntimeError("stopping")
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=self.env)
+        self.proc = p
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            raise RuntimeError(f"{argv[0]} timed out after {timeout:g} s")
+        finally:
+            self.proc = None
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+        if p.returncode != 0:
+            raise RuntimeError(f"{argv[0]} failed ({p.returncode}): "
+                               + err.decode(errors="replace").strip()[:300])
+        return out
+
+    def kill(self):
+        self.stopping = True
+        p = self.proc
+        if p is not None:
+            try:
+                p.kill()
+            except OSError:
+                pass
+
+
+def grab_thumb(runner, stable_id, width):
     """Tiny PPM thumbnail of one window via grim -T (works off-screen)."""
     scale = min(1.0, SCREEN_THUMB_WIDTH / max(1, width))
-    out = subprocess.run(["grim", "-T", stable_id, "-s", f"{scale:.4f}",
-                          "-t", "ppm", "-"], capture_output=True, timeout=10,
-                         env=env)
-    if out.returncode != 0:
-        raise RuntimeError("grim thumbnail failed: "
-                           + out.stderr.decode(errors="replace").strip())
-    return parse_ppm(out.stdout)
+    return parse_ppm(runner.run(["grim", "-T", stable_id, "-s", f"{scale:.4f}",
+                                 "-t", "ppm", "-"], timeout=5))
 
 
-def grab_frame(stable_id, path, quality, env):
-    """Full-resolution JPEG of one window, published atomically."""
-    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path))
-    out = subprocess.run(["grim", "-T", stable_id, "-t", "jpeg",
-                          "-q", str(quality), tmp], capture_output=True,
-                         timeout=20, env=env)
-    if out.returncode != 0 or not os.path.exists(tmp):
-        raise RuntimeError("grim capture failed: "
-                           + out.stderr.decode(errors="replace").strip())
-    with open(tmp, "rb") as f:
-        w, h = jpeg_size(f.read(65536))
-    os.replace(tmp, path)
-    return w, h
+def grab_frame(runner, stable_id, quality):
+    """Full-resolution JPEG bytes of one window (grim writes to a pipe, so
+    no file exists until we create it ourselves, 0600)."""
+    data = runner.run(["grim", "-T", stable_id, "-t", "jpeg",
+                       "-q", str(quality), "-"], timeout=10)
+    if not data.startswith(b"\xff\xd8"):
+        raise RuntimeError("grim returned no JPEG")
+    return data
+
+
+def frame_budget_error(used, free, size, p):
+    """Why a frame of `size` bytes must not be written (None if it may):
+    the screenshot byte budget, or the free space the audio needs."""
+    if used + size > p["max_mb"] * 1e6:
+        return f"screenshot budget reached (max_mb = {p['max_mb']:g})"
+    if free - size < p["min_free_mb"] * 1e6:
+        return (f"disk nearly full: keeping min_free_mb = "
+                f"{p['min_free_mb']:g} for the audio")
+    return None
+
+
+def screens_session_ok(raw, session_id):
+    """The capture worker's lifetime check: its raw dir exists, session.json
+    still names this session (id, or raw dir for an id-less session) and
+    at least one audio recorder is still the process we started."""
+    if not os.path.isdir(raw):
+        return False
+    state = read_state()
+    if not state:
+        return False
+    if session_id:
+        if state.get("id") != session_id:
+            return False
+    elif state.get("session_dir") != raw:
+        return False
+    return session_live(state)
+
+
+SCREENS_LOG_MAX = 256 * 1024
 
 
 def cmd_screens_loop(args=()):
     """Hidden: capture "new and settled" frames of the call window into
-    <raw>/screens/ until the session ends (spawned by start, stopped by stop)."""
+    <raw>/screens/ until the session ends (spawned by start, stopped by
+    stop). args: <raw-dir> [<session-id> <monotonic-origin>]."""
     if not args:
-        print("usage: meet-recorder screens-loop <session-raw-dir>",
-              file=sys.stderr)
+        print("usage: meet-recorder screens-loop <session-raw-dir> "
+              "[<session-id> <origin>]", file=sys.stderr)
         return 2
     raw = os.path.abspath(args[0])
-    shots = os.path.join(raw, "screens")
-    os.makedirs(shots, exist_ok=True)
+    session_id = args[1] if len(args) > 1 else ""
     try:
-        start = float(os.path.basename(raw))
-    except ValueError:
-        start = time.time()
+        origin = float(args[2])
+    except (IndexError, ValueError):
+        origin = time.monotonic()
+    shots = os.path.join(raw, "screens")
+    log_path = os.path.join(raw, "screens.log")
+    manifest = os.path.join(raw, "screens.jsonl")
+    if not os.path.isdir(raw):          # session already over: never recreate
+        return 0
+    make_private_dir(raw)
+    make_private_dir(shots)
     p = screen_params(load_config())
-    env = hypr_env()
+    runner = CaptureRunner(hypr_env())
     try:
         os.nice(10)
     except OSError:
         pass
 
     stop = []
+
+    def on_signal(*_):
+        stop.append(1)
+        runner.kill()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, lambda *_: stop.append(1))
+        signal.signal(sig, on_signal)
 
     last_err = [None]
 
     def log(msg):
-        """Log to screens.log; repeated identical errors are logged once."""
+        """Best effort, bounded: identical repeats are logged once, the log
+        stops growing at SCREENS_LOG_MAX, and a full disk is ignored."""
         if msg == last_err[0]:
             return
         last_err[0] = msg
-        with open(os.path.join(raw, "screens.log"), "a") as f:
-            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
-
-    keep_state, prev, kept_thumb, orphan = dict(SCREEN_KEEP_START), None, None, 0
-    prev_sid = None
-    next_tick = time.monotonic()
-    while not stop:
-        # Exit when the session is over (stop, crash recovery, finalize).
-        state = read_state()
-        same = bool(state) and state.get("session_dir") == raw
-        orphan = 0 if same else orphan + 1
-        if not os.path.isdir(raw) or orphan >= 2:
-            break
         try:
-            clients = run_json(["hyprctl", "clients", "-j"], None)
-            if clients is None:
-                prev = None
-                raise RuntimeError("hyprctl clients failed")
+            if os.path.getsize(log_path) > SCREENS_LOG_MAX:
+                return
+        except OSError:
+            pass
+        try:
+            append_private(log_path, time.strftime("%H:%M:%S ") + msg + "\n")
+        except OSError:
+            pass
+
+    misses, last_check = [0], [0.0]
+
+    def session_over():
+        """Checked about every second, independent of the capture cadence;
+        three misses in a row (a fresh worker may run before start has
+        published session.json) end the loop."""
+        last_check[0] = time.monotonic()
+        try:
+            ok = screens_session_ok(raw, session_id)
+        except Exception:
+            ok = False
+        misses[0] = 0 if ok else misses[0] + 1
+        return not os.path.isdir(raw) or misses[0] >= 3
+
+    keep_state, prev, kept_thumb = dict(SCREEN_KEEP_START), None, None
+    prev_sid, used, last_size = None, 0, 1_000_000
+    next_tick = time.monotonic()
+    while not stop and not session_over():
+        try:
+            out = runner.run(["hyprctl", "clients", "-j"], timeout=5)
+            try:
+                clients = json.loads(out)
+            except ValueError:
+                raise RuntimeError("hyprctl clients: bad JSON")
             win = pick_screen_window(clients, p["window_class"])
             if win is None:
                 prev = None
                 log(f"no window of class {p['window_class']!r}")
             else:
                 sid = str(win["stableId"])
-                if sid != prev_sid:
+                if sid != prev_sid:            # another window: no stale diff
                     prev, prev_sid = None, sid
                 try:
-                    thumb = grab_thumb(sid, (win.get("size") or [0])[0], env)
+                    thumb = grab_thumb(runner, sid, (win.get("size") or [0])[0])
                 except Exception:
-                    prev = None
+                    prev = None                # failed sample: restart settling
                     raise
-                t = time.time() - start
+                t = time.monotonic() - origin
                 d_prev = cell_diffs(prev, thumb)
                 d_kept = cell_diffs(kept_thumb, thumb)
                 prev = thumb
                 new_state, keep = screen_keep_step(keep_state, d_prev, d_kept,
                                                    t, p)
+                # A keep only counts once the JPEG and its manifest line are
+                # both on disk; until then it is retried on later ticks.
                 keep_state = dict(new_state, kept=keep_state["kept"],
                                   last_keep=keep_state["last_keep"])
                 if keep:
+                    st = os.statvfs(raw)
+                    free = st.f_bavail * st.f_frsize
+                    why = frame_budget_error(used, free, last_size, p)
+                    if why:
+                        raise RuntimeError(why)
+                    data = grab_frame(runner, sid, p["jpeg_quality"])
+                    why = frame_budget_error(used, free, len(data), p)
+                    if why:
+                        raise RuntimeError(why)
                     name = screen_file_name(t)
-                    w, h = grab_frame(sid, os.path.join(shots, name),
-                                      p["jpeg_quality"], env)
-                    keep_state, kept_thumb = new_state, thumb
-                    with open(os.path.join(raw, "screens.jsonl"), "a",
-                              encoding="utf-8") as f:
-                        f.write(json.dumps({
+                    path = os.path.join(shots, name)
+                    w, h = jpeg_size(data[:65536])
+                    write_bytes_atomic(path, data, private=True)
+                    try:
+                        append_private(manifest, json.dumps({
                             "t": round(t, 1), "file": name,
                             "window_title": clean_window_title(
                                 win.get("title", "")),
                             "w": w, "h": h}) + "\n")
+                    except BaseException:
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                        raise
+                    keep_state, kept_thumb = new_state, thumb
+                    used, last_size = used + len(data), len(data)
                 last_err[0] = None
         except Exception as e:      # never let a bad tick end the loop
+            if stop:
+                break
             log(f"{type(e).__name__}: {e}")
         next_tick += p["interval_seconds"]
         now = time.monotonic()
@@ -1507,6 +1977,28 @@ def cmd_screens_loop(args=()):
             next_tick = now + p["interval_seconds"]
         while not stop and time.monotonic() < next_tick:
             time.sleep(min(0.25, max(0.0, next_tick - time.monotonic())))
+            if (not stop and time.monotonic() - last_check[0] >= 1.0
+                    and session_over()):
+                return 0
+    return 0
+
+
+def cmd_collect_screens(args=()):
+    """Hidden: copy a finished session's frames into its folder (spawned by
+    stop / recovery; safe to re-run). args: <raw-dir> <session-folder>."""
+    if len(args) < 2:
+        print("usage: meet-recorder collect-screens <raw-dir> <folder>",
+              file=sys.stderr)
+        return 2
+    folder = os.path.abspath(os.path.expanduser(args[1]))
+    n = collect_screens(os.path.abspath(os.path.expanduser(args[0])), folder)
+    log = os.path.join(folder, "collect.log")
+    try:
+        if os.path.getsize(log) == 0:
+            os.remove(log)
+    except OSError:
+        pass
+    print(f"{folder}: {n} screen frame(s)")
     return 0
 
 
@@ -1550,10 +2042,49 @@ def cmd_link_screens(args=()):
     return rc
 
 
+def newest_transcript_folder(base):
+    """Newest <base>/YYYY-MM-DD/<HHMMSS-...>/ that contains transcript.md
+    (any source: manual, teams, legacy meeting), or None."""
+    best = None
+    try:
+        days = [d for d in os.listdir(base)
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d)]
+    except OSError:
+        return None
+    for day in days:
+        try:
+            names = os.listdir(os.path.join(base, day))
+        except OSError:
+            continue
+        for name in names:
+            folder = os.path.join(base, day, name)
+            if (re.match(r"\d{6}-", name)
+                    and os.path.isfile(os.path.join(folder, "transcript.md"))
+                    and (best is None or (day, name) > best[0])):
+                best = ((day, name), folder)
+    return best[1] if best else None
+
+
+def cmd_latest(args=()):
+    """Hidden: print the newest session folder that has a transcript."""
+    base = os.path.expanduser(load_config().get("paths", "output_dir"))
+    folder = newest_transcript_folder(base)
+    if not folder:
+        print(f"no recording with a transcript under {base}", file=sys.stderr)
+        return 1
+    print(folder)
+    return 0
+
+
 def cmd_toggle(args=()):
-    if session_live(read_state()):
-        return cmd_stop()
-    return cmd_start()
+    try:
+        with lifecycle_lock():          # decide and act as one transition
+            if session_live(read_state()):
+                return cmd_stop()
+            return cmd_start()
+    except TimeoutError as e:
+        print(f"busy: {e}", file=sys.stderr)
+        return 1
 
 
 def auto_enabled(cfg):
@@ -1567,8 +2098,15 @@ def cmd_auto(args=()):
     if want in ("on", "off", "toggle"):
         new = (not auto_enabled(cfg)) if want == "toggle" else want == "on"
         cfg.set("auto", "enabled", "true" if new else "false")
-        with open(CONFIG_FILE, "w") as f:
-            cfg.write(f)
+        # Rewrite only the user's own file + this key: writing the merged
+        # cfg would freeze every current default (e.g. [screens]
+        # thresholds) into config.ini.
+        raw = configparser.ConfigParser(interpolation=None)
+        raw.read(CONFIG_FILE)
+        if not raw.has_section("auto"):
+            raw.add_section("auto")
+        raw.set("auto", "enabled", "true" if new else "false")
+        write_text_atomic(CONFIG_FILE, config_text(raw))
     print("on" if auto_enabled(cfg) else "off")
     return 0
 
@@ -1615,9 +2153,6 @@ def cmd_watch(args=()):
     hand mid-call, it stays stopped until the next call.
     """
     cfg = ensure_config()
-    state = read_state()
-    if state is not None and not session_live(state):
-        recover_stale(state)
 
     seen_since = None      # when the call was first seen
     gone_since = None      # when the call was last seen ending
@@ -1631,9 +2166,20 @@ def cmd_watch(args=()):
         if mtime != cfg_mtime:
             cfg, cfg_mtime = load_config(), mtime
         now = time.time()
+        # Recorders / workers we started are our children: collect them so
+        # a dead one is gone (not a zombie that looks alive to stop).
+        reap()
         in_call = call_active(cfg)
         state = read_state()
         live = session_live(state)
+        if state is not None and not live:
+            # The recorders died under a session (crash, PipeWire restart):
+            # save it now and end its capture worker, not at the next start.
+            try:
+                recover_if_stale()
+            except TimeoutError:
+                pass
+            state, live = read_state(), False
 
         if in_call:
             gone_since = None
@@ -1664,7 +2210,8 @@ COMMANDS = {"start": cmd_start, "stop": cmd_stop, "toggle": cmd_toggle,
             "status": cmd_status, "auto": cmd_auto, "watch": cmd_watch,
             "transcribe": cmd_transcribe, "export": cmd_export,
             "moments": cmd_moments, "link-screens": cmd_link_screens,
-            "screens-loop": cmd_screens_loop}
+            "screens-loop": cmd_screens_loop,
+            "collect-screens": cmd_collect_screens, "latest": cmd_latest}
 
 
 def main(argv=None):
