@@ -349,8 +349,8 @@ def call_streams(source_outputs, apps):
         hay = " ".join(str(props.get(k, "")) for k in (
             "application.name", "application.process.binary",
             "application.id", "node.name")).lower()
-        if "pw-record" in hay:
-            continue  # our own recorder
+        if "pw-record" in hay or "meet-recorder." in hay:
+            continue  # our own recorder / echo canceller streams
         if any(a and a in hay for a in apps):
             hits.append(so)
     return hits
@@ -372,11 +372,187 @@ def app_device(streams, devices, apps, key, default):
     return ""
 
 
-# The echo-cancelled mic shipped in pipewire/50-meet-recorder-aec.conf.
-AEC_SOURCE = "meet-recorder.aec-mic"
-# pactl source states in which the node exists and starts when pulled
-# (with passive streams the AEC source idles as SUSPENDED until recorded).
-USABLE_SOURCE_STATES = {"RUNNING", "IDLE", "SUSPENDED"}
+# Echo cancellation (see NOTES.md "Echo-cancelled mic"). The module never
+# runs inside the PipeWire daemon: each recording starts its own client
+# process (`pipewire -c <session>/aec.conf`, like filter-chain.conf) and
+# stops it with the recorders. Its output node is recorder-private: a
+# media.class that WirePlumber never picks as a default/fallback device
+# and pipewire-pulse never lists (it matches neither "Audio/Source" nor
+# "Stream/Output/Audio" exactly), with no autoconnect, so nothing but our
+# own pw-record (target.object = its name) is ever linked to it.
+AEC_PREFIX = "meet-recorder.aec"
+AEC_MEDIA_CLASS = "Stream/Output/Audio/Internal"
+AEC_NODE_WAIT = 4.0       # s for the helper's nodes to appear
+AEC_LINK_WAIT = 3.0       # s for WirePlumber to link our recorder to it
+
+
+def aec_names(session_id):
+    """Per-session node names (a leftover helper never collides)."""
+    return {k: f"{AEC_PREFIX}-{k}.{session_id}"
+            for k in ("mic", "capture", "reference", "recorder")}
+
+
+def spa_str(value):
+    """A SPA-JSON string literal (JSON string syntax is valid SPA JSON)."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def aec_conf_text(names, mic):
+    """Config for the per-recording AEC client process.
+
+    Mirrors /usr/share/pipewire/filter-chain.conf (a client: no
+    core.daemon, so no server socket) plus module-echo-cancel:
+    - capture: target.object = the SAME real mic node the raw recorder
+      pins, not passive (it must run whenever we record).
+    - reference (monitor.mode): untargeted capture of the default sink's
+      monitor -- the same rule the speaker recorder follows; AEC is only
+      used when that recorder is not pinned (plan_mic).
+    - output: media.class AEC_MEDIA_CLASS + node.autoconnect = false
+      (source.props are merged before the module's "Audio/Source"
+      default, module-echo-cancel.c pipewire__module_init).
+    `flags = [ ifexists nofail ]`: even a broken module never makes this
+    process fail to start; the recorder then sees no node and records the
+    raw mic only.
+    """
+    return f"""# meet-recorder per-recording echo canceller (generated; see NOTES.md)
+context.properties = {{
+    log.level = 2
+}}
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+context.modules = [
+    {{ name = libpipewire-module-rt
+        args = {{ }}
+        flags = [ ifexists nofail ]
+    }}
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+    {{ name = libpipewire-module-echo-cancel
+        args = {{
+            library.name = aec/libspa-aec-webrtc
+            monitor.mode = true
+            audio.channels = 1
+            audio.position = [ MONO ]
+            capture.props = {{
+                node.name = {spa_str(names["capture"])}
+                node.description = "Meet recorder AEC capture"
+                target.object = {spa_str(mic)}
+                node.passive = false
+            }}
+            sink.props = {{
+                node.name = {spa_str(names["reference"])}
+                node.description = "Meet recorder AEC reference"
+            }}
+            source.props = {{
+                node.name = {spa_str(names["mic"])}
+                node.description = "Meet recorder mic (echo-cancelled, private)"
+                media.class = {spa_str(AEC_MEDIA_CLASS)}
+                node.autoconnect = false
+                node.dont-fallback = true
+                priority.session = 1
+                priority.driver = 1
+            }}
+        }}
+        flags = [ ifexists nofail ]
+    }}
+]
+"""
+
+
+def aec_env(env=None):
+    """Environment for the AEC helper: drop variables that would load
+    another config instead of ours or force autoconnect on its output."""
+    env = dict(os.environ if env is None else env)
+    for k in ("PIPEWIRE_CONFIG_NAME", "PIPEWIRE_CONFIG_PREFIX",
+              "PIPEWIRE_CONFIG_DIR", "PIPEWIRE_AUTOCONNECT"):
+        env.pop(k, None)
+    return env
+
+
+def pw_nodes(dump):
+    """{node.name: (id, props)} from parsed `pw-dump` output."""
+    nodes = {}
+    for o in dump or []:
+        if not isinstance(o, dict) or o.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = ((o.get("info") or {}).get("props")) or {}
+        name = props.get("node.name")
+        if name:
+            nodes[name] = (o.get("id"), props)
+    return nodes
+
+
+def pw_links(dump):
+    """[(output node id, input node id)] from parsed `pw-dump` output."""
+    out = []
+    for o in dump or []:
+        if isinstance(o, dict) and o.get("type") == "PipeWire:Interface:Link":
+            info = o.get("info") or {}
+            out.append((info.get("output-node-id"), info.get("input-node-id")))
+    return out
+
+
+def aec_graph_state(dump, names):
+    """Where the AEC helper stands in a pw-dump snapshot:
+    'missing' (output node not there yet), 'unsafe' (it is there but not
+    private: wrong media.class, or linked to anything but our recorder),
+    'ready' (private, not linked yet) or 'linked' (only to our recorder).
+    """
+    nodes = pw_nodes(dump)
+    src = nodes.get(names["mic"])
+    if src is None:
+        return "missing"
+    src_id, props = src
+    if props.get("media.class") != AEC_MEDIA_CLASS:
+        return "unsafe"
+    rec = nodes.get(names["recorder"])
+    rec_id = rec[0] if rec else None
+    peers = {i for o, i in pw_links(dump) if o == src_id}
+    if peers - {rec_id}:
+        return "unsafe"
+    return "linked" if rec_id is not None and rec_id in peers else "ready"
+
+
+def is_real_mic(source):
+    """A pactl source dict that is a usable microphone for the raw track:
+    not a sink monitor, not an echo canceller, not one of ours."""
+    name = str(source.get("name") or "")
+    props = source.get("properties", {}) or {}
+    return bool(name) and not (
+        name.endswith(".monitor") or name.startswith("meet-recorder.")
+        or str(source.get("monitor_of_sink") or "n/a") not in ("", "n/a")
+        or props.get("device.class") == "monitor"
+        or str(props.get("node.link-group", "")).startswith("echo-cancel"))
+
+
+def plan_mic(setting, sources, mic, pin_sink="", pin_mic=""):
+    """How to record the "Me" side.
+
+    setting: mic_source_setting(); sources: parsed `pactl -f json list
+    sources`; mic: the mic the call uses (pin_mic or the default source);
+    pin_sink / pin_mic: app_device() results ('' = default).
+    Returns (aec, target, note): aec = run the echo canceller on `mic`;
+    target = what the raw-mic recorder pins ('' = follow the default).
+    With AEC the raw recorder always pins the real mic node explicitly.
+    Never fails: anything doubtful records the raw mic as before.
+    """
+    if setting == "raw":
+        return False, pin_mic, "raw mic (mic_source = raw)"
+    by_name = {s.get("name"): s for s in sources or [] if s.get("name")}
+    if setting != "auto":
+        if setting in by_name:
+            return False, setting, f"mic_source {setting}"
+        return False, pin_mic, f"raw mic: mic_source {setting!r} not found"
+    if pin_sink:
+        # The reference follows the DEFAULT sink; Teams plays elsewhere.
+        return False, pin_mic, "raw mic: call app plays to a non-default sink"
+    src = by_name.get(mic)
+    if src is None or not is_real_mic(src):
+        return False, pin_mic, f"raw mic: {mic or '?'} is not a real mic"
+    return True, mic, f"echo-cancelled {mic} (+ raw backup)"
 
 
 def mic_source_setting(value):
@@ -388,66 +564,78 @@ def mic_source_setting(value):
     return "raw" if value.lower() == "raw" else value
 
 
-def is_echo_cancel_source(source):
-    """A pactl source dict that is an echo-cancel module's output."""
-    props = source.get("properties", {}) or {}
-    return (source.get("name") == AEC_SOURCE
-            or str(props.get("node.link-group", "")).startswith("echo-cancel"))
+# Mic track choice (pick_mic_track). The AEC track must PROVE itself;
+# anything doubtful records/uses the raw mic.
+PROFILE_WINDOW = 1.0      # s per peak window
+SILENT_PEAK = 2           # window peak (of 32767) <= this: digital silence
+RAW_SIGNAL_PEAK = 100     # window peak above this: the raw mic has signal
+AEC_GAP_TOLERANCE = 0.5   # s the AEC track may fall short of expectation
+AEC_MAX_LEAD = 15.0       # s; a longer head start than this is implausible
+AEC_SILENT_RUN = 10       # windows: AEC silent this long ...
+AEC_SILENT_RUN_SIGNAL = 5  # ... while raw has signal in this many -> raw
 
 
-def pick_mic_source(setting, sources, pinned=""):
-    """Which source the mic recorder captures.
+def silent_stretch(aec_peaks, raw_peaks, offset=0):
+    """True if some AEC_SILENT_RUN consecutive windows are digital silence
+    on the AEC track while the raw track has signal in at least
+    AEC_SILENT_RUN_SIGNAL of them. aec window i+offset lines up with raw
+    window i (the AEC track starts earlier). A stretch where both are
+    quiet is not evidence (nobody spoke). A recording shorter than
+    AEC_SILENT_RUN windows is judged whole: AEC silent throughout while
+    raw has signal in at least half of it."""
+    need = min(AEC_SILENT_RUN, len(raw_peaks))
+    sig_need = max(1, min(AEC_SILENT_RUN_SIGNAL, (need + 1) // 2))
+    run = []                   # raw-signal flags of the current AEC-silent run
+    for i, rp in enumerate(raw_peaks):
+        j = i + offset
+        ap = aec_peaks[j] if 0 <= j < len(aec_peaks) else None
+        if ap is None or ap > SILENT_PEAK:
+            run = []
+            continue
+        run.append(rp > RAW_SIGNAL_PEAK)
+        if len(run) >= need and sum(run[-need:]) >= sig_need:
+            return True
+    return False
 
-    setting: mic_source_setting(); sources: parsed `pactl -f json list
-    sources`; pinned: app_device() for the call app's mic ('' = default).
-    Returns (target, echo_cancel, note): target '' = no --target, follow
-    the default mic. Never fails: anything missing falls back to the
-    previous behaviour (default mic, or the call app's pinned mic).
-    'auto' skips AEC when the call app uses a non-default mic: the AEC
-    capture follows the DEFAULT mic, so it would record the wrong one.
+
+def pick_mic_track(aec, raw, lead=0.0):
+    """Choose the mic track of a session recorded with echo cancellation.
+
+    aec / raw: wav_profile() of the echo-cancelled / raw-mic WAV, or None
+    (missing, empty, unreadable). lead: seconds the AEC recorder was
+    linked before the raw/speaker recorders started (session.json
+    `aec_lead`; all recorders are stopped together, so a complete AEC
+    track is raw + lead long).
+    Returns (choice, trim, reason): choice 'aec' or 'raw'; trim = seconds
+    to cut from the start of the AEC track so it lines up with sys.wav.
+    'aec' only if all of:
+      - both tracks are readable 16-bit (peaks known);
+      - no capture gap: the AEC track is at most AEC_GAP_TOLERANCE short
+        of raw + lead, and its head start is <= AEC_MAX_LEAD;
+      - no sustained silence: silent_stretch() is False.
+    With no raw track the AEC one is all there is ('aec').
     """
-    by_name = {s.get("name"): s for s in sources or [] if s.get("name")}
-    if setting == "raw":
-        return pinned, False, "raw mic (mic_source = raw)"
-    if setting == "auto":
-        if pinned:
-            return pinned, False, "raw mic: call app uses a non-default mic"
-        src = by_name.get(AEC_SOURCE)
-        if src is None:
-            return "", False, "raw mic: echo-cancel source not loaded"
-        state = str(src.get("state", "")).upper()
-        if state not in USABLE_SOURCE_STATES:
-            return "", False, f"raw mic: echo-cancel source is {state or '?'}"
-        return AEC_SOURCE, True, "echo-cancelled mic"
-    src = by_name.get(setting)
-    if src is None:
-        return pinned, False, f"raw mic: mic_source {setting!r} not found"
-    return setting, is_echo_cancel_source(src), f"mic_source {setting}"
-
-
-# A track whose peak never exceeds this (of 32767) is digital silence.
-SILENT_PEAK = 2
-
-
-def pick_mic_track(aec, raw):
-    """Choose the mic track after recording with echo cancellation.
-
-    aec / raw: wav_stats() of the echo-cancelled and the raw-mic WAV, or
-    None (missing, empty, unreadable). Returns 'aec' or 'raw'. The AEC
-    track is used unless it is evidently broken while the raw one is not:
-    missing, digital silence (an AEC node that never ran), or less than
-    half as long (it stalled). Unknown peaks (non-16-bit) count as fine.
-    """
-    if raw is None:
-        return "aec"
     if aec is None:
-        return "raw"
-    if raw["seconds"] > 5 and aec["seconds"] < raw["seconds"] / 2:
-        return "raw"
-    if (aec["peak"] is not None and aec["peak"] <= SILENT_PEAK
-            and (raw["peak"] is None or raw["peak"] > SILENT_PEAK)):
-        return "raw"
-    return "aec"
+        return "raw", 0.0, "echo-cancelled track missing or empty"
+    if raw is None:
+        return "aec", 0.0, "raw track missing; echo-cancelled track only"
+    if aec.get("peaks") is None or raw.get("peaks") is None:
+        return "raw", 0.0, "cannot analyse the tracks (not 16-bit)"
+    lead = max(0.0, float(lead or 0.0))
+    actual = aec["seconds"] - raw["seconds"]
+    if actual > AEC_MAX_LEAD:
+        return "raw", 0.0, f"echo-cancelled track {actual:.1f}s too long"
+    short = lead - actual
+    if short > AEC_GAP_TOLERANCE:
+        return "raw", 0.0, f"echo-cancelled track has a {short:.1f}s gap"
+    # Lengths agree (|short| <= tolerance): the measured head start is the
+    # exact alignment. AEC longer than expected = the RAW track lost time;
+    # then the recorded lead is the better estimate.
+    trim = max(0.0, actual) if short >= -AEC_GAP_TOLERANCE else lead
+    if silent_stretch(aec["peaks"], raw["peaks"],
+                      int(round(trim / PROFILE_WINDOW))):
+        return "raw", 0.0, "echo-cancelled track silent while the mic was not"
+    return "aec", trim, "echo-cancelled track complete"
 
 
 def whisper_options(cfg):
@@ -1006,7 +1194,33 @@ def send_signal(proc, sig):
             os.close(fd)
 
 
-def stop_procs(recorders, worker=None, timeout=5.0):
+def aec_proc(state):
+    """(pid, start) of the session's AEC helper process, or None."""
+    pid = (state or {}).get("aec_pid")
+    return (pid, state.get("aec_start")) if isinstance(pid, int) else None
+
+
+def stop_helpers(helpers, timeout=3.0):
+    """SIGTERM identity-checked helper processes (the AEC `pipewire -c`
+    client: its main loop quits on SIGTERM), SIGKILL after timeout.
+    Unverifiable ones (no saved start time) are never signalled."""
+    live = [h for h in helpers or ()
+            if h and h[1] is not None and send_signal(h, signal.SIGTERM)]
+    ours = [p for p, _ in live]
+    deadline = time.monotonic() + timeout
+    while live and time.monotonic() < deadline:
+        reap(ours)
+        live = [h for h in live if pid_alive(*h)]
+        if live:
+            time.sleep(0.1)
+    for h in live:
+        send_signal(h, signal.SIGKILL)
+    if live:
+        time.sleep(0.1)
+    reap(ours)
+
+
+def stop_procs(recorders, worker=None, timeout=5.0, helpers=()):
     """Stop a session's processes; bounded and never raises.
 
     recorders: [(pid, start)] get SIGINT (pw-record finalizes the WAV).
@@ -1018,28 +1232,34 @@ def stop_procs(recorders, worker=None, timeout=5.0):
     Anything still alive after timeout gets SIGKILL. Processes whose
     identity no longer matches (exited, PID reused) are never signalled,
     nor a worker whose start time was never saved (unverifiable).
+    helpers: [(pid, start)] (the AEC process) are stopped AFTER the
+    recorders, so every recorder ends at the same moment (stop_helpers).
     """
-    if worker and worker[1] is None:
-        print(f"not signalling screens worker {worker[0]}: no saved start "
-              "time to verify it", file=sys.stderr)
-        worker = None
-    live = [p for p in recorders if send_signal(p, signal.SIGINT)]
-    if worker and send_signal(worker, signal.SIGTERM):
-        live.append(worker)
-    ours = [p for p, _ in live]
-    deadline = time.monotonic() + timeout
-    while True:
-        reap(ours)
-        live = [p for p in live if pid_alive(*p)]
-        if not live:
-            return
-        if time.monotonic() >= deadline:
-            break
+    try:
+        if worker and worker[1] is None:
+            print(f"not signalling screens worker {worker[0]}: no saved "
+                  "start time to verify it", file=sys.stderr)
+            worker = None
+        live = [p for p in recorders if send_signal(p, signal.SIGINT)]
+        if worker and send_signal(worker, signal.SIGTERM):
+            live.append(worker)
+        ours = [p for p, _ in live]
+        deadline = time.monotonic() + timeout
+        while True:
+            reap(ours)
+            live = [p for p in live if pid_alive(*p)]
+            if not live:
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        for p in live:
+            send_signal(p, signal.SIGKILL)
         time.sleep(0.1)
-    for p in live:
-        send_signal(p, signal.SIGKILL)
-    time.sleep(0.1)
-    reap(ours)
+        reap(ours)
+    finally:
+        if helpers:
+            stop_helpers(helpers)
 
 
 def notify(title, body=""):
@@ -1287,6 +1507,78 @@ def pactl_default(kind):
                                    stdin=subprocess.DEVNULL).strip()
 
 
+def wait_aec_graph(names, want, timeout, procs):
+    """Poll pw-dump until aec_graph_state() is in `want`; returns the last
+    state. Stops early on 'unsafe' or when one of procs (Popen) exited."""
+    deadline = time.monotonic() + timeout
+    st = "missing"
+    while True:
+        st = aec_graph_state(run_json(["pw-dump"], []), names)
+        if st in want or st == "unsafe":
+            return st
+        if any(p.poll() is not None for p in procs):
+            return "exited"
+        if time.monotonic() >= deadline:
+            return st
+        time.sleep(0.15)
+
+
+def start_aec(sess_dir, names, mic, base, wav, quiet, procs, helpers):
+    """Start the per-recording echo canceller and its recorder.
+
+    Runs `pipewire -c <sess_dir>/aec.conf` (a separate PipeWire client
+    process: nothing is loaded into the daemon, a crash or a missing
+    WebRTC plugin only ends this process), waits for its private output
+    node, then starts pw-record on it (target.object = that node,
+    node.dont-fallback: if it vanishes the recorder is destroyed rather
+    than silently falling back to the default mic) and waits until
+    WirePlumber linked it. Spawned processes are appended to procs /
+    helpers at once (the caller's rollback stops them).
+    Returns the monotonic time the link was seen, or None: AEC is not
+    used and everything this started is stopped again. Never raises an
+    Exception (only BaseException, for the caller's rollback).
+    """
+    helper = rec = None
+    try:
+        conf = os.path.join(sess_dir, "aec.conf")
+        fd = os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(aec_conf_text(names, mic))
+        with open(os.path.join(sess_dir, "aec.log"), "wb") as log:
+            p = subprocess.Popen(["pipewire", "-c", conf],
+                                 stdin=subprocess.DEVNULL, stdout=log,
+                                 stderr=log, start_new_session=True,
+                                 env=aec_env())
+        helper = (p.pid, proc_start(p.pid))
+        helpers.append(helper)
+        st = wait_aec_graph(names, {"ready", "linked"}, AEC_NODE_WAIT, [p])
+        if st not in ("ready", "linked"):
+            raise RuntimeError(f"echo canceller {st}")
+        r = subprocess.Popen(
+            base + ["-P", "{ node.name = %s node.dont-fallback = true }"
+                    % spa_str(names["recorder"]),
+                    "--target", names["mic"], wav], **quiet)
+        rec = (r.pid, proc_start(r.pid))
+        procs.append(rec)
+        st = wait_aec_graph(names, {"linked"}, AEC_LINK_WAIT, [p, r])
+        if st != "linked":
+            raise RuntimeError(f"echo-cancelled recorder {st}")
+        return time.monotonic()
+    except Exception as e:
+        print(f"echo cancellation not used: {e}", file=sys.stderr)
+        if rec:
+            stop_procs([rec], timeout=1)
+            procs.remove(rec)
+        if helper:
+            stop_helpers([helper])
+            helpers.remove(helper)
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
+        return None
+
+
 def start_locked(cfg, source, stale=None):
     """cmd_start body; runs under lifecycle_lock. session.json is published
     once, complete (recorders verified, screens worker attached), so no
@@ -1341,10 +1633,11 @@ def start_locked(cfg, source, stale=None):
     pin_mic = app_device(
         run_json(["pactl", "-f", "json", "list", "source-outputs"], []),
         sources, apps, "source", mic)
-    # Mic: the echo-cancelled source when it is there (the far side played
-    # through speakers is removed from me.m4a), else as before.
-    mic_target, echo, mic_note = pick_mic_source(settings["mic_source"],
-                                                 sources, pin_mic)
+    # Mic: with echo cancellation (auto, call app on the default sink, a
+    # real mic) the far side played through speakers is removed from the
+    # "Me" track; the raw mic is recorded too, from that real mic node.
+    use_aec, mic_target, mic_note = plan_mic(
+        settings["mic_source"], sources, pin_mic or mic, pin_sink, pin_mic)
     print(f"mic: {mic_note}", file=sys.stderr)
     sink, mic = pin_sink or sink, pin_mic or mic
     title = meeting_title(cfg)
@@ -1359,22 +1652,30 @@ def start_locked(cfg, source, stale=None):
         return 1
     sys_wav = os.path.join(sess_dir, "sys.wav")
     mic_wav = os.path.join(sess_dir, "mic.wav")
-    # With AEC the raw mic is recorded too: finalize falls back to it if
-    # the AEC track turns out silent/stalled, so AEC can never cost audio.
-    mic_raw_wav = os.path.join(sess_dir, "mic-raw.wav") if echo else ""
+    mic_raw_wav = os.path.join(sess_dir, "mic-raw.wav")
     base = ["pw-record", "--channels", "1", "--rate", rate]
-    argvs = [base + ["-P", "{ stream.capture.sink = true }"]
-             + (["--target", pin_sink] if pin_sink else []) + [sys_wav],
-             base + (["--target", mic_target] if mic_target else [])
-             + [mic_wav]]
-    if echo:
-        argvs.append(base + (["--target", pin_mic] if pin_mic else [])
-                     + [mic_raw_wav])
-    procs, worker = [], None
+    procs, helpers, worker = [], [], None
     # Everything from the first spawn to the published state is one unit:
     # any failure (or exception) stops what was spawned and removes the raw
     # dir, so nothing runs untracked by session.json.
     try:
+        # The AEC recorder starts (and is linked) BEFORE the others, so a
+        # complete AEC track is longer than the raw one by exactly the
+        # recorded lead; finalize trims that and treats a shortfall as a gap.
+        linked = None
+        if use_aec:
+            linked = start_aec(sess_dir, aec_names(session_id), mic, base,
+                               mic_wav, quiet, procs, helpers)
+        echo = linked is not None
+        raw_wav = mic_raw_wav if echo else mic_wav
+        # AEC planned but unavailable -> exactly the old raw behaviour.
+        raw_target = pin_mic if use_aec and not echo else mic_target
+        if use_aec and not echo:
+            mic_note = "raw mic: echo canceller unavailable"
+        argvs = [base + ["-P", "{ stream.capture.sink = true }"]
+                 + (["--target", pin_sink] if pin_sink else []) + [sys_wav],
+                 base + (["--target", raw_target] if raw_target else [])
+                 + [raw_wav]]
         # Taken immediately before audio starts (after all the slow probes):
         # wall time names the folder, the monotonic origin times the frames.
         start_unix, origin = int(time.time()), time.monotonic()
@@ -1384,11 +1685,9 @@ def start_locked(cfg, source, stale=None):
             children.append(p)
             procs.append((p.pid, proc_start(p.pid)))
         time.sleep(0.4)
-        # The speaker side plus at least one mic recorder must be up (a
-        # dead AEC recorder is fine while the raw-mic one runs: finalize
-        # then uses the raw track).
-        if (children[0].poll() is not None
-                or all(p.poll() is not None for p in children[1:])):
+        # The speaker side plus the raw mic recorder must be up (the AEC
+        # one is optional: finalize then uses the raw track).
+        if any(p.poll() is not None for p in children):
             raise RuntimeError("pw-record failed to open the speaker or "
                                "microphone.")
         state = {"id": session_id, "pids": [p for p, _ in procs],
@@ -1396,17 +1695,20 @@ def start_locked(cfg, source, stale=None):
                  "start": start_unix, "origin": origin,
                  "session_dir": sess_dir, "sys_wav": sys_wav,
                  "mic_wav": mic_wav, "source": source, "title": title,
-                 "sink": sink, "mic": mic, "mic_source": mic_target,
-                 "mic_echo_cancel": echo}
+                 "sink": sink, "mic": mic, "mic_source": raw_target,
+                 "mic_note": mic_note, "mic_echo_cancel": echo}
         if echo:
             state["mic_raw_wav"] = mic_raw_wav
+            state["aec_lead"] = round(max(0.0, origin - linked), 3)
+        if helpers:
+            state["aec_pid"], state["aec_start"] = helpers[0]
         if settings["screens"]:
             worker = spawn_screens(sess_dir, session_id, origin)
             if worker:
                 state["screens_pid"], state["screens_start"] = worker
         write_state(state)
     except BaseException as e:
-        stop_procs(procs, worker, timeout=1)
+        stop_procs(procs, worker, timeout=1, helpers=helpers)
         shutil.rmtree(sess_dir, ignore_errors=True)
         if not isinstance(e, Exception):
             raise
@@ -1493,10 +1795,10 @@ def write_transcripts(folder, segments, start_unix, duration, title="",
     return None
 
 
-def wav_stats(path):
-    """{'seconds', 'peak'} of a WAV, or None if missing/tiny/unreadable.
-    peak (max |sample|) only for 16-bit audio, else None. Reads in chunks
-    (an hour of 16 kHz mono is ~115 MB)."""
+def wav_profile(path, window=PROFILE_WINDOW):
+    """{'seconds', 'peaks'} of a WAV, or None if missing/tiny/unreadable.
+    peaks: max |sample| per `window` seconds (16-bit audio only, else
+    None). Reads in window-sized chunks (an hour of 16 kHz mono ~115 MB)."""
     import array
     import wave
     try:
@@ -1504,46 +1806,131 @@ def wav_stats(path):
             return None
         with wave.open(path, "rb") as w:
             rate, width = w.getframerate(), w.getsampwidth()
-            frames, peak = w.getnframes(), (0 if width == 2 else None)
-            if peak is not None:
-                while True:
-                    chunk = w.readframes(1 << 18)
-                    if not chunk:
-                        break
-                    a = array.array("h")
-                    a.frombytes(chunk[:len(chunk) // 2 * 2])
-                    if sys.byteorder == "big":
-                        a.byteswap()
-                    if a:
-                        peak = max(peak, max(a), -min(a))
+            frames = w.getnframes()
+            peaks = [] if width == 2 else None
+            step = max(1, int(rate * window))
+            while peaks is not None:
+                chunk = w.readframes(step)
+                if not chunk:
+                    break
+                a = array.array("h")
+                a.frombytes(chunk[:len(chunk) // 2 * 2])
+                if sys.byteorder == "big":
+                    a.byteswap()
+                if a:
+                    peaks.append(max(max(a), -min(a)))
     except (OSError, EOFError, wave.Error):
         return None
     if not frames or not rate:
         return None
-    return {"seconds": frames / rate, "peak": peak}
+    return {"seconds": frames / rate, "peaks": peaks}
+
+
+def wav_stats(path):
+    """{'seconds', 'peak'} of a WAV (whole-file peak), or None."""
+    prof = wav_profile(path)
+    if prof is None:
+        return None
+    peaks = prof["peaks"]
+    return {"seconds": prof["seconds"],
+            "peak": None if peaks is None else max(peaks, default=0)}
+
+
+def mic_choice(state):
+    """(mic WAV, trim seconds, echo_cancel, reason) for a stopped session.
+    Sessions recorded with AEC also have the raw mic (pick_mic_track)."""
+    mic_wav, raw = state["mic_wav"], state.get("mic_raw_wav")
+    if not (state.get("mic_echo_cancel") and raw):
+        return mic_wav, 0.0, False, ""
+    choice, trim, reason = pick_mic_track(
+        wav_profile(mic_wav), wav_profile(raw), state.get("aec_lead", 0.0))
+    print(f"mic track: {choice} ({reason})", file=sys.stderr)
+    if choice == "raw":
+        return raw, 0.0, False, reason
+    return mic_wav, trim, True, reason
 
 
 def choose_mic_wav(state):
-    """(mic WAV to use, echo_cancel) for a stopped session. Sessions
-    recorded with AEC also have the raw mic; see pick_mic_track."""
-    mic_wav, raw = state["mic_wav"], state.get("mic_raw_wav")
-    if not (state.get("mic_echo_cancel") and raw):
-        return mic_wav, bool(state.get("mic_echo_cancel"))
-    if pick_mic_track(wav_stats(mic_wav), wav_stats(raw)) == "raw":
-        print("echo-cancelled mic track unusable; using the raw mic",
-              file=sys.stderr)
-        return raw, False
-    return mic_wav, True
+    """(mic WAV to use, echo_cancel); see mic_choice."""
+    wav, _, echo, _ = mic_choice(state)
+    return wav, echo
+
+
+def media_seconds(path):
+    """Duration of an encoded file by ffprobe, or None if unreadable."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60,
+            stdin=subprocess.DEVNULL)
+        return float(out.stdout.strip()) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def encoded_ok(path, expect_seconds):
+    """An encoded output exists and is (nearly) as long as its input."""
+    got = media_seconds(path)
+    return got is not None and got >= expect_seconds * 0.95 - 1.0
+
+
+def encode_session(folder, sys_wav, mic_wav, trim, cfg, verify):
+    """Encode meeting.m4a, me.m4a, others.m4a into folder; returns the
+    tracks used. trim: seconds cut from the start of mic_wav (the AEC
+    recorder's head start). verify: meeting.m4a and me.m4a must decode
+    at full length, else RuntimeError (the caller falls back to raw)."""
+    have = [w for w in (sys_wav, mic_wav)
+            if os.path.exists(w) and os.path.getsize(w) > 1024]
+    if not have:
+        raise RuntimeError("no audio was captured")
+    final_m4a = os.path.join(folder, "meeting.m4a")
+    mic_in = (["-ss", f"{trim:.3f}"] if trim > 0 else []) + ["-i", mic_wav]
+    if len(have) == 2:
+        cmd = build_ffmpeg_mix_cmd(
+            sys_wav, mic_wav, final_m4a,
+            cfg.getfloat("audio", "sys_volume"),
+            cfg.getfloat("audio", "mic_volume"),
+            cfg.getint("audio", "sample_rate"))
+        i = cmd.index(mic_wav)
+        cmd[i - 1:i + 1] = mic_in
+    else:  # one track is missing/empty: keep what we have
+        src = mic_in if have[0] == mic_wav else ["-i", have[0]]
+        cmd = ["ffmpeg", "-y"] + src + ["-c:a", "aac", "-b:a", "96k",
+                                       final_m4a]
+    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                 stderr=subprocess.DEVNULL)
+    subprocess.run(cmd, check=True, **quiet)
+    secs = {}
+    if verify:
+        for w in have:
+            secs[w] = (wav_stats(w) or {}).get("seconds", 0.0)
+        if mic_wav in secs:
+            secs[mic_wav] = max(0.0, secs[mic_wav] - trim)
+        if not encoded_ok(final_m4a, max(secs.values())):
+            raise RuntimeError("meeting.m4a did not verify")
+    # Keep each side as its own small file so the transcript can say who spoke.
+    for wav, name in ((mic_wav, "me.m4a"), (sys_wav, "others.m4a")):
+        if wav in have:
+            src = mic_in if wav == mic_wav else ["-i", wav]
+            out = os.path.join(folder, name)
+            subprocess.run(["ffmpeg", "-y"] + src + ["-c:a", "aac", "-b:a",
+                            "48k", out], check=False, **quiet)
+            if verify and wav == mic_wav and not encoded_ok(out, secs[wav]):
+                raise RuntimeError("me.m4a did not verify")
+    return have
 
 
 def finalize_audio(state, cfg):
-    """Mix the raw tracks into the output folder; returns the folder path."""
+    """Mix the raw tracks into the output folder; returns the folder path.
+    No WAV is deleted before the outputs are encoded; the echo-cancelled
+    choice must also verify (full-length meeting.m4a and me.m4a), else
+    everything is encoded again from the raw mic."""
     sys_wav = state["sys_wav"]
-    mic_wav, echo = choose_mic_wav(state)
+    mic_wav, trim, echo, reason = mic_choice(state)
     start_unix = state["start"]
-    have =[w for w in (sys_wav, mic_wav)
-            if os.path.exists(w) and os.path.getsize(w) > 1024]
-    if not have:
+    if not any(os.path.exists(w) and os.path.getsize(w) > 1024
+               for w in (sys_wav, mic_wav)):
         raise RuntimeError("no audio was captured")
 
     source = state.get("source", "manual")
@@ -1553,39 +1940,36 @@ def finalize_audio(state, cfg):
     day = time.strftime("%Y-%m-%d", time.localtime(start_unix))
     folder = os.path.join(out_base, day, session_dir_name(start_unix, slug))
     os.makedirs(folder, exist_ok=True)
-    final_m4a = os.path.join(folder, "meeting.m4a")
 
-    if len(have) == 2:
-        cmd = build_ffmpeg_mix_cmd(
-            sys_wav, mic_wav, final_m4a,
-            cfg.getfloat("audio", "sys_volume"),
-            cfg.getfloat("audio", "mic_volume"),
-            cfg.getint("audio", "sample_rate"))
-    else:  # one track is missing/empty: keep what we have
-        cmd = ["ffmpeg", "-y", "-i", have[0], "-c:a", "aac", "-b:a", "96k",
-               final_m4a]
-    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                 stderr=subprocess.DEVNULL)
-    subprocess.run(cmd, check=True, **quiet)
-    # Keep each side as its own small file so the transcript can say who spoke.
-    for wav, name in ((mic_wav, "me.m4a"), (sys_wav, "others.m4a")):
-        if wav in have:
-            subprocess.run(["ffmpeg", "-y", "-i", wav, "-c:a", "aac", "-b:a",
-                            "48k", os.path.join(folder, name)],
-                           check=False, **quiet)
+    raw = state.get("mic_raw_wav")
+    try:
+        have = encode_session(folder, sys_wav, mic_wav, trim, cfg,
+                              verify=echo)
+    except (RuntimeError, subprocess.CalledProcessError) as e:
+        if not (echo and raw):
+            raise
+        print(f"echo-cancelled encode failed ({e}); using the raw mic",
+              file=sys.stderr)
+        mic_wav, echo = raw, False
+        reason = f"echo-cancelled encode failed: {e}"
+        have = encode_session(folder, sys_wav, mic_wav, 0.0, cfg,
+                              verify=False)
 
     # Raw WAVs are disposable once the mix succeeds. Nothing here reads
     # screen data: the raw dir (frames, manifest, log) belongs to the
     # separate collect-screens job, which also removes it, so no screen
-    # problem can delay or fail the audio or the transcription.
-    for wav in filter(None, {sys_wav, state["mic_wav"],
-                             state.get("mic_raw_wav")}):
+    # problem can delay or fail the audio or the transcription. The AEC
+    # helper's config/log go too (the collector keeps a dir with extras).
+    sess = state.get("session_dir") or ""
+    extras = ([os.path.join(sess, "aec.conf"), os.path.join(sess, "aec.log")]
+              if sess else [])
+    for f in filter(None, {sys_wav, state["mic_wav"], raw, *extras}):
         try:
-            os.remove(wav)
+            os.remove(f)
         except OSError:
             pass
 
-    write_json(os.path.join(folder, "meta.json"), {
+    meta = {
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z",
                                  time.localtime(start_unix)),
         "source": source, "title": title,
@@ -1595,7 +1979,10 @@ def finalize_audio(state, cfg):
         "mic_echo_cancel": echo and mic_wav in have,
         "audio": "meeting.m4a", "transcript": "transcript.md",
         "transcript_status": "pending",
-    })
+    }
+    if state.get("mic_echo_cancel"):
+        meta["mic_track_reason"] = reason
+    write_json(os.path.join(folder, "meta.json"), meta)
     return folder
 
 
@@ -1872,7 +2259,8 @@ def recover_stale(state):
     finalizes (finish_session) AFTER releasing the lock."""
     with lifecycle_lock():
         clear_state()
-        stop_procs(state_procs(state), screens_proc(state), timeout=2)
+        stop_procs(state_procs(state), screens_proc(state), timeout=2,
+                   helpers=[aec_proc(state)])
     return state
 
 
@@ -1934,7 +2322,8 @@ def stop_locked(expect_id=None, expect_source=None):
         return None
     # Never raises: a signalling problem (PID reuse, permissions) must not
     # cost the audio finalization.
-    stop_procs(state_procs(state), screens_proc(state))
+    stop_procs(state_procs(state), screens_proc(state),
+               helpers=[aec_proc(state)])
     clear_state()
     return state
 

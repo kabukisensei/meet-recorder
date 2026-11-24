@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REAL_POPEN = subprocess.Popen    # before any test patches it
 CLI_PATH = os.path.join(HERE, "..", "meet-recorder")
 
 _spec = importlib.util.spec_from_loader(
@@ -340,88 +341,269 @@ class TestAppDevice(unittest.TestCase):
         self.assertEqual(mr.app_device([], self.DEVS, ["teams"], "sink", "hdmi"), "")
 
 
-class TestMicSource(unittest.TestCase):
-    RAW = {"name": "alsa_input.webcam", "state": "RUNNING", "properties": {}}
-
-    def aec(self, state="SUSPENDED", name=None):
-        return {"name": name or mr.AEC_SOURCE, "state": state,
-                "properties": {"node.link-group": "echo-cancel-1234"}}
+class TestMicPlan(unittest.TestCase):
+    """plan_mic / is_real_mic (fix round 7: AEC only when provably safe)."""
+    MIC = {"name": "alsa_input.webcam", "monitor_of_sink": "n/a",
+           "properties": {"device.class": "sound"}}
+    HS = {"name": "bluez_input.hs", "properties": {}}
+    MON = {"name": "alsa_output.spk.monitor", "monitor_of_sink": "alsa_output.spk",
+           "properties": {"device.class": "monitor"}}
+    OLD_AEC = {"name": "echo-cancel-source",
+               "properties": {"node.link-group": "echo-cancel-7"}}
+    SOURCES = [MIC, HS, MON, OLD_AEC]
 
     def test_setting_normalised(self):
         for v, want in (("", "auto"), (None, "auto"), ("  AUTO ", "auto"),
                         ("Raw", "raw"), (" my.Node ", "my.Node")):
             self.assertEqual(mr.mic_source_setting(v), want)
 
-    def test_auto_uses_aec_when_present_in_any_live_state(self):
-        for st in ("RUNNING", "IDLE", "SUSPENDED", "running"):
-            target, echo, _ = mr.pick_mic_source(
-                "auto", [self.RAW, self.aec(st)])
-            self.assertEqual((target, echo), (mr.AEC_SOURCE, True), st)
+    def test_is_real_mic(self):
+        self.assertTrue(mr.is_real_mic(self.MIC))
+        self.assertTrue(mr.is_real_mic(self.HS))
+        for s in (self.MON, self.OLD_AEC, {"name": ""}, {},
+                  {"name": "x.monitor"}, {"name": "meet-recorder.aec-mic.1"},
+                  {"name": "y", "monitor_of_sink": "spk"}):
+            self.assertFalse(mr.is_real_mic(s), s)
 
-    def test_auto_falls_back_to_default_mic(self):
-        for sources in ([self.RAW], [], None,
-                        [self.RAW, self.aec("INVALID")], [self.aec("")]):
-            target, echo, note = mr.pick_mic_source("auto", sources)
-            self.assertEqual((target, echo), ("", False), sources)
+    def test_auto_real_default_mic_uses_aec_and_pins_raw(self):
+        aec, target, note = mr.plan_mic("auto", self.SOURCES,
+                                        "alsa_input.webcam")
+        self.assertEqual((aec, target), (True, "alsa_input.webcam"))
+        self.assertIn("raw backup", note)
+
+    def test_auto_pinned_mic_aec_on_that_mic(self):
+        # the canceller captures the same mic the call uses
+        self.assertEqual(mr.plan_mic("auto", self.SOURCES, "bluez_input.hs",
+                                     pin_mic="bluez_input.hs")[:2],
+                         (True, "bluez_input.hs"))
+
+    def test_auto_skips_aec_when_call_plays_to_non_default_sink(self):
+        for pin_mic in ("", "bluez_input.hs"):
+            aec, target, note = mr.plan_mic("auto", self.SOURCES,
+                                            pin_mic or "alsa_input.webcam",
+                                            pin_sink="bluez_output.hs",
+                                            pin_mic=pin_mic)
+            self.assertEqual((aec, target), (False, pin_mic))
+            self.assertIn("non-default sink", note)
+
+    def test_auto_skips_aec_without_a_real_mic(self):
+        for mic in ("alsa_output.spk.monitor", "echo-cancel-source", "gone",
+                    ""):
+            aec, target, note = mr.plan_mic("auto", self.SOURCES, mic)
+            self.assertEqual((aec, target), (False, ""), mic)
             self.assertTrue(note.startswith("raw mic"))
+        self.assertFalse(mr.plan_mic("auto", None, "alsa_input.webcam")[0])
 
-    def test_auto_keeps_pinned_mic_of_call_app(self):
-        # AEC follows the DEFAULT mic; Teams on another mic wins.
-        self.assertEqual(
-            mr.pick_mic_source("auto", [self.RAW, self.aec()], "headset")[:2],
-            ("headset", False))
-
-    def test_raw(self):
-        self.assertEqual(mr.pick_mic_source("raw", [self.aec()])[:2],
-                         ("", False))
-        self.assertEqual(mr.pick_mic_source("raw", [self.aec()], "hs")[:2],
-                         ("hs", False))
-
-    def test_explicit_node(self):
-        self.assertEqual(
-            mr.pick_mic_source("alsa_input.webcam", [self.RAW])[:2],
-            ("alsa_input.webcam", False))
-        other_aec = self.aec(name="my-echo-cancel-source")
-        self.assertEqual(
-            mr.pick_mic_source("my-echo-cancel-source", [other_aec])[:2],
-            ("my-echo-cancel-source", True))
+    def test_raw_and_explicit(self):
+        self.assertEqual(mr.plan_mic("raw", self.SOURCES, "alsa_input.webcam")[:2],
+                         (False, ""))
+        self.assertEqual(mr.plan_mic("raw", self.SOURCES, "bluez_input.hs",
+                                     pin_mic="bluez_input.hs")[:2],
+                         (False, "bluez_input.hs"))
+        self.assertEqual(mr.plan_mic("bluez_input.hs", self.SOURCES, "x")[:2],
+                         (False, "bluez_input.hs"))
         # missing -> previous behaviour, never a failure
-        self.assertEqual(mr.pick_mic_source("gone", [self.RAW], "hs")[:2],
-                         ("hs", False))
+        self.assertEqual(mr.plan_mic("gone", self.SOURCES, "x", pin_mic="hs")[:2],
+                         (False, "hs"))
+
+
+class TestAecConf(unittest.TestCase):
+    """The generated per-recording config keeps the safety rules."""
+    NAMES = mr.aec_names("1795530225-abc123")
+
+    def conf(self, mic="alsa_input.webcam"):
+        return re.sub(r"#.*", "", mr.aec_conf_text(self.NAMES, mic))
+
+    def module_block(self, text):
+        return text[text.index("libpipewire-module-echo-cancel"):]
+
+    def test_names_are_per_session(self):
+        self.assertEqual(self.NAMES["mic"],
+                         "meet-recorder.aec-mic.1795530225-abc123")
+        self.assertEqual(len(set(self.NAMES.values())), 4)
+
+    def test_module_never_mandatory(self):
+        # conf.c load_module(): without nofail a failed module returns
+        # -errno and the process does not start.
+        block = self.module_block(self.conf())
+        self.assertIn("flags = [ ifexists nofail ]", block)
+
+    def test_output_is_private(self):
+        text = self.conf()
+        src = text[text.index("source.props"):]
+        self.assertIn(f'media.class = "{mr.AEC_MEDIA_CLASS}"', src)
+        self.assertIn("node.autoconnect = false", src)
+        self.assertIn(f'node.name = "{self.NAMES["mic"]}"', src)
+        # pipewire-pulse lists exactly these classes; WirePlumber defaults
+        # and fallback targets use Audio/* device classes only.
+        for listed in ("Audio/Source", "Audio/Duplex", "Audio/Source/Virtual",
+                       "Stream/Output/Audio"):
+            self.assertNotEqual(mr.AEC_MEDIA_CLASS, listed)
+        self.assertTrue(mr.AEC_MEDIA_CLASS.startswith("Stream/"))
+        self.assertNotIn("filter.smart", text)
+        # a client, never a second daemon/server
+        self.assertNotIn("core.daemon", text)
+
+    def test_capture_pins_the_raw_mic_and_quotes_it(self):
+        text = self.conf('we"ird\\mic')
+        cap = text[text.index("capture.props"):text.index("sink.props")]
+        self.assertIn('target.object = "we\\"ird\\\\mic"', cap)
+        self.assertIn("node.passive = false", cap)
+        ref = text[text.index("sink.props"):text.index("source.props")]
+        self.assertNotIn("target.object", ref)   # follows the default sink
+
+    def test_balanced(self):
+        text = self.conf()
+        self.assertEqual(text.count("{"), text.count("}"))
+        self.assertEqual(text.count("["), text.count("]"))
+        self.assertIn("monitor.mode = true", text)
+        self.assertIn("library.name = aec/libspa-aec-webrtc", text)
+
+    def test_env_scrubbed(self):
+        env = mr.aec_env({"PATH": "/bin", "PIPEWIRE_CONFIG_NAME": "x.conf",
+                          "PIPEWIRE_AUTOCONNECT": "1",
+                          "PIPEWIRE_CONFIG_PREFIX": "p",
+                          "XDG_RUNTIME_DIR": "/run/user/1000"})
+        self.assertEqual(env, {"PATH": "/bin",
+                               "XDG_RUNTIME_DIR": "/run/user/1000"})
+
+    def test_no_daemon_drop_in_shipped(self):
+        # The daemon never loads the canceller (fix round 7).
+        self.assertFalse(Path(HERE, "..", "pipewire",
+                              "50-meet-recorder-aec.conf").exists())
+        inst = Path(HERE, "..", "install-local.sh").read_text()
+        self.assertNotIn("install -D -m 644 pipewire/", inst)
+        self.assertIn("rm -f ~/.config/pipewire/pipewire.conf.d/"
+                      "50-meet-recorder-aec.conf", inst)
+
+
+class TestAecGraphState(unittest.TestCase):
+    NAMES = mr.aec_names("s1")
+
+    def node(self, nid, name, cls):
+        return {"id": nid, "type": "PipeWire:Interface:Node",
+                "info": {"props": {"node.name": name, "media.class": cls}}}
+
+    def link(self, out, inp):
+        return {"id": 900 + out + inp, "type": "PipeWire:Interface:Link",
+                "info": {"output-node-id": out, "input-node-id": inp}}
+
+    def dump(self, cls=None, links=(), rec=True):
+        d = [self.node(10, self.NAMES["mic"], cls or mr.AEC_MEDIA_CLASS),
+             self.node(30, "alsa_input.webcam", "Audio/Source")]
+        if rec:
+            d.append(self.node(20, self.NAMES["recorder"], "Stream/Input/Audio"))
+        return d + [self.link(o, i) for o, i in links] + ["junk", None]
+
+    def test_states(self):
+        st = lambda d: mr.aec_graph_state(d, self.NAMES)
+        self.assertEqual(st([]), "missing")
+        self.assertEqual(st(None), "missing")
+        self.assertEqual(st(self.dump(rec=False)), "ready")
+        self.assertEqual(st(self.dump()), "ready")
+        self.assertEqual(st(self.dump(links=[(10, 20)])), "linked")
+        # not private (module ignored our media.class) -> never used
+        self.assertEqual(st(self.dump(cls="Audio/Source")), "unsafe")
+        # linked to anything but our recorder -> never used
+        self.assertEqual(st(self.dump(links=[(10, 30)], rec=False)), "unsafe")
+        self.assertEqual(st(self.dump(links=[(10, 20), (10, 30)])), "unsafe")
+        # links INTO it (its capture side) are fine
+        self.assertEqual(st(self.dump(links=[(30, 10), (10, 20)])), "linked")
 
 
 class TestPickMicTrack(unittest.TestCase):
-    def st(self, seconds=600.0, peak=9000):
-        return {"seconds": seconds, "peak": peak}
+    def prof(self, seconds=600, peaks=None, level=900):
+        n = int(seconds)
+        return {"seconds": float(seconds),
+                "peaks": [level] * n if peaks is None else peaks}
 
-    def test_good_aec_wins(self):
-        self.assertEqual(mr.pick_mic_track(self.st(), self.st()), "aec")
-        # a quiet but live AEC track (user never spoke) is still AEC
-        self.assertEqual(mr.pick_mic_track(self.st(peak=40), self.st()), "aec")
+    def test_complete_aec_wins_and_is_trimmed(self):
+        aec, raw = self.prof(601.2), self.prof(600)
+        choice, trim, _ = mr.pick_mic_track(aec, raw, lead=1.1)
+        self.assertEqual(choice, "aec")
+        self.assertAlmostEqual(trim, 1.2)
+        # a quiet but live AEC track (far side only, echo removed) is AEC
+        quiet = self.prof(600, level=12)
+        self.assertEqual(mr.pick_mic_track(quiet, raw)[0], "aec")
 
     def test_missing_tracks(self):
-        self.assertEqual(mr.pick_mic_track(None, self.st()), "raw")
-        self.assertEqual(mr.pick_mic_track(self.st(), None), "aec")
-        self.assertEqual(mr.pick_mic_track(None, None), "aec")
+        self.assertEqual(mr.pick_mic_track(None, self.prof())[0], "raw")
+        self.assertEqual(mr.pick_mic_track(None, None)[0], "raw")
+        self.assertEqual(mr.pick_mic_track(self.prof(), None)[:2], ("aec", 0.0))
 
-    def test_digital_silence_falls_back(self):
-        self.assertEqual(mr.pick_mic_track(self.st(peak=0), self.st()), "raw")
-        self.assertEqual(mr.pick_mic_track(self.st(peak=2), self.st()), "raw")
-        # both silent: nothing to gain, keep AEC
-        self.assertEqual(mr.pick_mic_track(self.st(peak=0), self.st(peak=0)),
-                         "aec")
-        # unknown peak (non-16-bit) is not evidence of silence
-        self.assertEqual(mr.pick_mic_track(self.st(peak=None), self.st()),
-                         "aec")
-
-    def test_stalled_falls_back(self):
-        self.assertEqual(mr.pick_mic_track(self.st(seconds=200), self.st()),
+    def test_unknown_format_is_raw(self):
+        self.assertEqual(mr.pick_mic_track(self.prof(peaks=None) | {"peaks": None},
+                                           self.prof())[0], "raw")
+        self.assertEqual(mr.pick_mic_track(self.prof(),
+                                           {"seconds": 600.0, "peaks": None})[0],
                          "raw")
-        self.assertEqual(mr.pick_mic_track(self.st(seconds=400), self.st()),
-                         "aec")
-        # very short recordings: duration noise is not a stall
-        self.assertEqual(mr.pick_mic_track(self.st(seconds=1),
-                                           self.st(seconds=4)), "aec")
+
+    def test_gap_is_raw(self):
+        raw = self.prof(600)
+        # expected 601.0 s, got 600.4: 0.6 s missing
+        self.assertEqual(mr.pick_mic_track(self.prof(600.4), raw, 1.0)[0], "raw")
+        # within tolerance
+        self.assertEqual(mr.pick_mic_track(self.prof(600.6), raw, 1.0)[0], "aec")
+        # the old "half as long" rule would have kept these
+        self.assertEqual(mr.pick_mic_track(self.prof(360), raw)[0], "raw")
+        self.assertEqual(mr.pick_mic_track(self.prof(599), raw)[0], "raw")
+
+    def test_implausible_head_start_is_raw(self):
+        choice, _, reason = mr.pick_mic_track(self.prof(700), self.prof(600), 1.0)
+        self.assertEqual(choice, "raw")
+        self.assertIn("too long", reason)
+
+    def test_raw_lost_time_uses_recorded_lead(self):
+        # AEC 3 s longer than expected: the RAW recorder lost time
+        choice, trim, _ = mr.pick_mic_track(self.prof(604), self.prof(600), 1.0)
+        self.assertEqual((choice, trim), ("aec", 1.0))
+
+    def test_full_digital_silence_is_raw(self):
+        self.assertEqual(mr.pick_mic_track(self.prof(level=0), self.prof())[0],
+                         "raw")
+        self.assertEqual(mr.pick_mic_track(self.prof(level=2), self.prof())[0],
+                         "raw")
+        # both silent: nobody spoke, nothing to gain
+        self.assertEqual(mr.pick_mic_track(self.prof(level=0),
+                                           self.prof(level=0))[0], "aec")
+
+    def test_sustained_silent_stretch_is_raw(self):
+        raw = self.prof(120)
+        peaks = [900] * 120
+        peaks[50:60] = [0] * 10              # 10 s dead while raw has signal
+        self.assertEqual(mr.pick_mic_track(self.prof(120, peaks), raw)[0], "raw")
+        peaks[50:60] = [900] * 10
+        peaks[50:59] = [0] * 9               # 9 s: not sustained
+        self.assertEqual(mr.pick_mic_track(self.prof(120, peaks), raw)[0], "aec")
+
+    def test_silent_stretch_needs_raw_signal(self):
+        raw_peaks = [900] * 120
+        raw_peaks[40:80] = [30] * 40         # nobody near the mic
+        aec_peaks = [900] * 120
+        aec_peaks[40:80] = [0] * 40
+        self.assertEqual(mr.pick_mic_track(self.prof(120, aec_peaks),
+                                           self.prof(120, raw_peaks))[0], "aec")
+        raw_peaks[40:45] = [900] * 5         # but 5 s of signal in a 10 s run
+        self.assertEqual(mr.pick_mic_track(self.prof(120, aec_peaks),
+                                           self.prof(120, raw_peaks))[0], "raw")
+
+    def test_silent_stretch_aligned_by_trim(self):
+        # AEC started 6 s earlier: its window i+6 is raw window i
+        raw_peaks = [900] * 60
+        raw_peaks[20:30] = [10] * 10         # raw quiet at 20..30
+        aec_peaks = [900] * 66
+        aec_peaks[26:36] = [0] * 10          # AEC quiet at the same moment
+        self.assertTrue(mr.silent_stretch(aec_peaks, raw_peaks, 0))
+        self.assertFalse(mr.silent_stretch(aec_peaks, raw_peaks, 6))
+        self.assertEqual(mr.pick_mic_track({"seconds": 66.0, "peaks": aec_peaks},
+                                           {"seconds": 60.0, "peaks": raw_peaks},
+                                           6.0)[:2], ("aec", 6.0))
+
+    def test_short_recording_judged_whole(self):
+        self.assertTrue(mr.silent_stretch([0, 0, 0], [900, 10, 900]))
+        self.assertFalse(mr.silent_stretch([0, 0, 0], [10, 10, 900]))
+        self.assertFalse(mr.silent_stretch([0, 50, 0], [900, 900, 900]))
+        self.assertFalse(mr.silent_stretch([], []))
 
 
 class TestWavStatsAndChoice(unittest.TestCase):
@@ -443,55 +625,94 @@ class TestWavStatsAndChoice(unittest.TestCase):
             w.writeframes(a.tobytes())
         return path
 
-    def test_stats(self):
-        p = self.wav("a.wav", [0, 5, -300, 7] * 4000)
-        self.assertEqual(mr.wav_stats(p), {"seconds": 1.0, "peak": 300})
+    def test_stats_and_profile(self):
+        p = self.wav("a.wav", [0, 5, -300, 7] * 4000 + [0, 9] * 4000)
+        self.assertEqual(mr.wav_stats(p), {"seconds": 1.5, "peak": 300})
+        self.assertEqual(mr.wav_profile(p), {"seconds": 1.5, "peaks": [300, 9]})
         self.assertIsNone(mr.wav_stats(os.path.join(self.d, "missing.wav")))
         self.assertIsNone(mr.wav_stats(self.wav("tiny.wav", [1] * 10)))
         junk = os.path.join(self.d, "junk.wav")
         Path(junk).write_bytes(b"x" * 4096)
-        self.assertIsNone(mr.wav_stats(junk))
+        self.assertIsNone(mr.wav_profile(junk))
 
     def test_choose_mic_wav(self):
-        live = self.wav("mic-raw.wav", [0, 1000, -1000, 3] * 40000)
-        silent = self.wav("mic.wav", [0] * 160000)
+        live = self.wav("mic-raw.wav", [0, 1000, -1000, 3] * 60000)   # 15 s
+        silent = self.wav("mic.wav", [0] * 240000)
         state = {"mic_wav": silent, "mic_raw_wav": live,
                  "mic_echo_cancel": True}
         self.assertEqual(mr.choose_mic_wav(state), (live, False))
-        good = self.wav("aec.wav", [0, 200, -50, 3] * 40000)
+        good = self.wav("aec.wav", [0, 200, -50, 3] * 60000)
         self.assertEqual(mr.choose_mic_wav(dict(state, mic_wav=good)),
                          (good, True))
         # no AEC / sessions from before this feature
         self.assertEqual(mr.choose_mic_wav({"mic_wav": silent}),
                          (silent, False))
 
-    def finalize(self, aec_samples):
+    def finalize(self, aec_samples, lead=0.0):
         sess = os.path.join(self.d, "raw")
         os.mkdir(sess)
         noise = [0, 900, -900, 40] * 8000                 # 2 s
+        Path(sess, "aec.conf").write_text("x")
+        Path(sess, "aec.log").write_text("")
         state = {"start": 1795530225, "source": "teams", "title": "",
+                 "session_dir": sess,
                  "sys_wav": self.wav("raw/sys.wav", noise),
                  "mic_wav": self.wav("raw/mic.wav", aec_samples),
                  "mic_raw_wav": self.wav("raw/mic-raw.wav", noise),
-                 "mic_echo_cancel": True}
+                 "mic_echo_cancel": True, "aec_lead": lead}
         cfg = mr.load_config(os.devnull)
         cfg.set("paths", "output_dir", os.path.join(self.d, "out"))
         folder = mr.finalize_audio(state, cfg)
         return folder, mr.read_json(os.path.join(folder, "meta.json")), sess
 
-    @unittest.skipUnless(__import__("shutil").which("ffmpeg"), "no ffmpeg")
-    def test_finalize_meta_and_cleanup(self):
-        folder, meta, sess = self.finalize([0, 300, -300, 5] * 8000)
-        self.assertIs(meta["mic_echo_cancel"], True)
-        self.assertEqual(meta["tracks"], ["sys.wav", "mic.wav"])
-        self.assertTrue(os.path.exists(os.path.join(folder, "me.m4a")))
-        self.assertEqual(os.listdir(sess), [])      # all three WAVs gone
+    def reset(self):
         __import__("shutil").rmtree(self.d)
         os.mkdir(self.d)
+
+    @unittest.skipUnless(__import__("shutil").which("ffprobe"), "no ffmpeg")
+    def test_finalize_meta_and_cleanup(self):
+        # AEC with a 0.5 s head start: used, trimmed, verified
+        folder, meta, sess = self.finalize([0, 300, -300, 5] * 10000, 0.5)
+        self.assertIs(meta["mic_echo_cancel"], True)
+        self.assertEqual(meta["mic_track_reason"], "echo-cancelled track complete")
+        self.assertEqual(meta["tracks"], ["sys.wav", "mic.wav"])
+        me = mr.media_seconds(os.path.join(folder, "me.m4a"))
+        self.assertAlmostEqual(me, 2.0, delta=0.1)   # 2.5 s - 0.5 s trim
+        self.assertEqual(os.listdir(sess), [])      # WAVs + aec.conf/log gone
+        self.reset()
         _, meta, sess = self.finalize([0] * 32000)  # AEC never ran
         self.assertIs(meta["mic_echo_cancel"], False)
         self.assertEqual(meta["tracks"], ["sys.wav", "mic-raw.wav"])
+        self.assertIn("silent", meta["mic_track_reason"])
         self.assertEqual(os.listdir(sess), [])
+
+    @unittest.skipUnless(__import__("shutil").which("ffprobe"), "no ffmpeg")
+    def test_unverified_aec_encode_falls_back_to_raw(self):
+        calls = []
+        real = mr.encoded_ok
+
+        def flaky(path, secs):
+            calls.append(os.path.basename(path))
+            return False if len(calls) == 1 else real(path, secs)
+        with mock.patch.object(mr, "encoded_ok", flaky):
+            folder, meta, sess = self.finalize([0, 300, -300, 5] * 8000)
+        self.assertIs(meta["mic_echo_cancel"], False)
+        self.assertEqual(meta["tracks"], ["sys.wav", "mic-raw.wav"])
+        self.assertIn("encode failed", meta["mic_track_reason"])
+        self.assertEqual(calls, ["meeting.m4a"])
+        self.assertTrue(os.path.exists(os.path.join(folder, "me.m4a")))
+
+    def test_wavs_kept_when_encoding_fails(self):
+        def boom(cmd, **kw):
+            if cmd[0] == "ffmpeg":
+                raise subprocess.CalledProcessError(1, cmd)
+            return subprocess.CompletedProcess(cmd, 1, "", "")
+        with mock.patch.object(mr.subprocess, "run", boom):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.finalize([0, 300, -300, 5] * 8000)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.d, "raw"))),
+                         ["aec.conf", "aec.log", "mic-raw.wav", "mic.wav",
+                          "sys.wav"])
 
 
 class TestWhisperOptions(unittest.TestCase):
@@ -547,24 +768,6 @@ class TestWhisperOptions(unittest.TestCase):
             self.assertEqual(kw["initial_prompt"], "Omarchy")
             self.assertEqual(kw["beam_size"], 5)
             self.assertTrue(kw["condition_on_previous_text"])
-
-
-class TestAecConf(unittest.TestCase):
-    """The shipped drop-in must keep the never-default rules."""
-    CONF = Path(HERE, "..", "pipewire", "50-meet-recorder-aec.conf")
-
-    def test_conf(self):
-        text = re.sub(r"#.*", "", self.CONF.read_text())
-        self.assertIn("libpipewire-module-echo-cancel", text)
-        self.assertIn("library.name = aec/libspa-aec-webrtc", text)
-        self.assertIn("monitor.mode = true", text)
-        self.assertIn(f'node.name = "{mr.AEC_SOURCE}"', text)
-        self.assertIn("priority.session = 1", text)
-        self.assertIn("priority.driver = 1", text)
-        # a smart filter would be spliced into every app's mic path
-        self.assertNotIn("filter.smart", text)
-        self.assertEqual(text.count("{"), text.count("}"))
-        self.assertEqual(text.count("["), text.count("]"))
 
 
 class TestVttTimestamp(unittest.TestCase):
@@ -1930,47 +2133,146 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
         self.assertEqual(len(spawned), 2)
         self.assertTrue(mr.session_live(mr.read_state()))
 
-    AEC = {"name": "meet-recorder.aec-mic", "state": "SUSPENDED",
-           "properties": {"node.link-group": "echo-cancel-1"}}
+    # check_output answers "default" for both get-default-sink/-source
+    MIC = {"name": "default", "monitor_of_sink": "n/a", "properties": {}}
 
-    def test_start_records_aec_plus_raw_fallback(self):
+    def aec_env(self, graph=("ready", "linked"), **kw):
+        """start_env plus a fake AEC helper (`pipewire -c`): records its
+        argv/env and scripts wait_aec_graph's answers."""
+        helpers, waits = [], list(graph)
+        spawned = self.start_env(**kw)
+        fake_popen = mr.subprocess.Popen
+
+        def popen(argv, **k):
+            if argv[0] == "pipewire":
+                helpers.append((argv, k.get("env"),
+                                Path(argv[2]).read_text()))
+                p = REAL_POPEN(["sleep", "60"], **k)
+                self.children.append(p)
+                spawned.append(p)
+                return p
+            return fake_popen(argv, **k)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(mr.subprocess, "Popen", popen))
+        stack.enter_context(mock.patch.object(
+            mr, "wait_aec_graph",
+            lambda *a, **k: waits.pop(0) if waits else "missing"))
+        self.addCleanup(stack.close)
+        return spawned, helpers
+
+    def test_start_records_aec_first_plus_explicit_raw(self):
         argvs = []
-        spawned = self.start_env(spawn=lambda *a: None, sources=[self.AEC],
-                                 argvs=argvs)
+        spawned, helpers = self.aec_env(spawn=lambda *a: None,
+                                        sources=[self.MIC], argvs=argvs)
         self.assertEqual(mr.cmd_start(), 0)
-        self.assertEqual(len(spawned), 3)
         st = mr.read_state()
+        names = mr.aec_names(st["id"])
         self.assertTrue(st["mic_echo_cancel"])
-        self.assertEqual(st["mic_source"], mr.AEC_SOURCE)
+        self.assertEqual(len(spawned), 4)        # helper + 3 recorders
         self.assertEqual(len(st["pids"]), 3)
-        sys_argv, aec_argv, raw_argv = argvs
-        self.assertIn("stream.capture.sink", " ".join(sys_argv))
-        self.assertEqual(aec_argv[-3:], ["--target", mr.AEC_SOURCE,
+        # the canceller: its own process, our generated config, clean env
+        (argv, env, conf), = helpers
+        self.assertEqual(argv, ["pipewire", "-c",
+                                os.path.join(st["session_dir"], "aec.conf")])
+        self.assertNotIn("PIPEWIRE_CONFIG_NAME", env)
+        self.assertIn('target.object = "default"', conf)
+        self.assertEqual(st["aec_pid"], spawned[0].pid)
+        self.assertIsNotNone(st["aec_start"])
+        self.assertNotIn(st["aec_pid"], st["pids"])
+        self.assertGreaterEqual(st["aec_lead"], 0.0)
+        # AEC recorder first (so it is complete), on the private node only
+        aec_argv, sys_argv, raw_argv = argvs
+        self.assertEqual(aec_argv[-3:], ["--target", names["mic"],
                                          st["mic_wav"]])
-        self.assertNotIn("--target", raw_argv)      # follows the default mic
-        self.assertEqual(raw_argv[-1], st["mic_raw_wav"])
+        self.assertIn("node.dont-fallback = true", " ".join(aec_argv))
+        self.assertIn(names["recorder"], " ".join(aec_argv))
+        self.assertIn("stream.capture.sink", " ".join(sys_argv))
+        # raw mic: explicitly the real mic node, never a default route
+        self.assertEqual(raw_argv[-3:], ["--target", "default",
+                                         st["mic_raw_wav"]])
+        # stop: recorders first, then the helper
+        order = []
+        real_send = mr.send_signal
+        with mock.patch.object(mr, "send_signal",
+                               lambda p, s: order.append((p[0], s))
+                               or real_send(p, s)):
+            mr.stop_procs(mr.state_procs(st), None, timeout=2,
+                          helpers=[mr.aec_proc(st)])
+        self.assertEqual(order[-1], (st["aec_pid"], signal.SIGTERM))
+        self.assertTrue(all(s == signal.SIGINT for _, s in order[:-1]))
+        self.assertFalse(mr.pid_alive(*mr.aec_proc(st)))
 
-    def test_start_without_aec_or_raw_setting_is_unchanged(self):
-        for sources, body in (([], None), ([self.AEC], "[audio]\nmic_source = raw\n")):
+    def test_aec_unavailable_records_raw_like_before(self):
+        for graph in (("missing",), ("unsafe",), ("exited",),
+                      ("ready", "ready"), ("ready", "unsafe")):
             argvs = []
             mr.clear_state()
-            self.start_env(spawn=lambda *a: None, sources=sources,
-                           argvs=argvs, cfg_body=body)
-            self.assertEqual(mr.cmd_start(), 0)
+            spawned, helpers = self.aec_env(graph=graph, spawn=lambda *a: None,
+                                            sources=[self.MIC], argvs=argvs)
+            self.assertEqual(mr.cmd_start(), 0, graph)
             st = mr.read_state()
-            self.assertFalse(st["mic_echo_cancel"])
+            self.assertFalse(st["mic_echo_cancel"], graph)
             self.assertNotIn("mic_raw_wav", st)
+            self.assertNotIn("aec_pid", st)
+            self.assertEqual(len(st["pids"]), 2, graph)
+            self.assertIn("unavailable", st["mic_note"])
+            sys_argv, raw_argv = argvs[-2:]
+            self.assertNotIn("--target", raw_argv)    # follows the default
+            self.assertEqual(raw_argv[-1], st["mic_wav"])
+            # everything the attempt started is gone again
+            for p in spawned[:-2]:
+                self.assertIsNotNone(p.wait(timeout=3))
+            self.assertFalse(os.path.exists(os.path.join(st["session_dir"],
+                                                         "mic-raw.wav")))
+            mr.stop_procs(mr.state_procs(st), None, timeout=1)
+
+    def test_no_aec_for_raw_setting_pinned_sink_or_no_real_mic(self):
+        cases = (([self.MIC], "[audio]\nmic_source = raw\n", None),
+                 ([], None, None),
+                 ([dict(self.MIC, monitor_of_sink="spk")], None, None),
+                 ([self.MIC], None, "bluez_output.hs"))
+        for sources, body, pin_sink in cases:
+            argvs = []
+            mr.clear_state()
+            spawned, helpers = self.aec_env(spawn=lambda *a: None,
+                                            sources=sources, argvs=argvs,
+                                            cfg_body=body)
+            with mock.patch.object(mr, "app_device",
+                                   lambda s, d, a, key, default:
+                                   pin_sink if key == "sink" and pin_sink
+                                   else ""):
+                self.assertEqual(mr.cmd_start(), 0)
+            st = mr.read_state()
+            self.assertEqual(helpers, [])               # never started
+            self.assertFalse(st["mic_echo_cancel"])
             self.assertEqual(len(argvs), 2)
             self.assertNotIn("--target", argvs[1])
             mr.stop_procs(mr.state_procs(st), None, timeout=1)
 
-    def test_dead_aec_recorder_does_not_fail_start(self):
-        spawned = self.start_env(spawn=lambda *a: None, sources=[self.AEC],
-                                 die={"mic.wav"})
+    def test_explicit_mic_source_is_recorded(self):
+        argvs = []
+        _, helpers = self.aec_env(spawn=lambda *a: None, argvs=argvs,
+                                  sources=[self.MIC, {"name": "usb.mic"}],
+                                  cfg_body="[audio]\nmic_source = usb.mic\n")
         self.assertEqual(mr.cmd_start(), 0)
-        self.assertEqual(len(spawned), 3)
-        self.assertTrue(mr.session_live(mr.read_state()))
+        st = mr.read_state()
+        self.assertEqual(helpers, [])
+        self.assertEqual(argvs[1][-3:], ["--target", "usb.mic", st["mic_wav"]])
+        mr.stop_procs(mr.state_procs(st), None, timeout=1)
 
+    def test_rollback_stops_aec_helper(self):
+        def bad_spawn(*a):
+            raise RuntimeError("boom")
+        spawned, helpers = self.aec_env(spawn=bad_spawn, sources=[self.MIC])
+        with mock.patch.object(mr, "stop_helpers",
+                               wraps=mr.stop_helpers) as sh:
+            self.assertEqual(mr.cmd_start(), 1)
+        self.assertEqual(len(helpers), 1)
+        self.assertEqual(len(sh.call_args.args[0]), 1)
+        for p in spawned:
+            self.assertIsNotNone(p.wait(timeout=3))
+        self.assertIsNone(mr.read_state())
+        self.assertEqual(os.listdir(mr.CACHE_DIR), [])
     def test_failure_after_spawning_leaves_no_orphan(self):
         for exc in (RuntimeError("boom"), KeyboardInterrupt()):
             def bad_spawn(*a, exc=exc):

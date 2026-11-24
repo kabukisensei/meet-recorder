@@ -19,10 +19,11 @@ rm -f "$plugin/BarWidget.qml"   # replaced by Panel.qml in 2.0
 install -D -m 644 systemd/meet-recorder-watch.service "$unit"
 install -d ~/Recordings
 install -m 644 RECORDINGS.md ~/Recordings/README.md
-# Echo-cancelled mic for the recorder. PipeWire is NOT restarted here (it
-# would cut a running call); the drop-in is read at the next PipeWire start.
-install -D -m 644 pipewire/50-meet-recorder-aec.conf \
-    ~/.config/pipewire/pipewire.conf.d/50-meet-recorder-aec.conf
+# Echo cancellation runs in a per-recording process now (meet-recorder
+# starts `pipewire -c <session>/aec.conf`); the daemon must never load it.
+# Remove the drop-in an older version may have installed (config only:
+# nothing is restarted, the running daemon is untouched).
+rm -f ~/.config/pipewire/pipewire.conf.d/50-meet-recorder-aec.conf
 
 systemctl --user daemon-reload
 systemctl --user enable meet-recorder-watch.service
@@ -32,4 +33,3 @@ systemctl --user restart meet-recorder-watch.service
 omarchy restart shell >/dev/null 2>&1 || true
 
 echo "synced: CLI + summarizer -> ~/.local/bin, bar widget -> omarchy plugin dir, watch service + shell restarted"
-echo "note: echo-cancelled mic takes effect after the next login, or (not during a call): systemctl --user restart pipewire pipewire-pulse wireplumber"

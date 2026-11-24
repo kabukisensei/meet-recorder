@@ -3,11 +3,14 @@ sys_volume = 1.0
 mic_volume = 2.0
 sample_rate = 16000
 # Which source the "Me" track records:
-#   auto  - the echo-cancelled mic (meet-recorder.aec-mic, from
-#           pipewire/50-meet-recorder-aec.conf) when it is loaded, else the
-#           default mic. With speakers this removes the far side from me.m4a.
+#   auto  - echo-cancel the mic the call uses (a private PipeWire process
+#           started for the recording only, never visible to Teams) and
+#           record the raw mic too; the echo-cancelled track is used only if
+#           it is complete and never went silent while the raw mic had sound.
+#           Skipped (raw mic) when the call app plays to a non-default
+#           speaker. With speakers this removes the far side from me.m4a.
 #   raw   - always the default mic (the old behaviour).
-#   <node.name> - a specific PipeWire source.
+#   <node.name> - a specific PipeWire source (no echo cancellation).
 mic_source = auto
 
 [whisper]
