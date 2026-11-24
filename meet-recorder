@@ -8,6 +8,7 @@ network calls, ever. faster-whisper is imported lazily, only at transcribe time.
 
 import configparser
 import contextlib
+import ctypes
 import datetime
 import fcntl
 import io
@@ -882,11 +883,10 @@ def session_live(state):
     return bool(state) and any(pid_alive(p, s) for p, s in state_procs(state))
 
 
-def send_signal(proc, sig, group=False):
+def send_signal(proc, sig):
     """Signal (pid, start) only if it is still that process. Uses a pidfd
     where possible so the identity check and the signal hit the same
-    process; group=True signals its whole process group instead (the
-    process leads one). Returns True if sent. Never raises."""
+    process. Returns True if sent. Never raises."""
     pid, start = proc
     fd = None
     try:
@@ -896,9 +896,7 @@ def send_signal(proc, sig, group=False):
             fd = None
         if not pid_alive(pid, start):
             return False
-        if group:
-            os.killpg(pid, sig)
-        elif fd is not None:
+        if fd is not None:
             signal.pidfd_send_signal(fd, sig)
         else:
             os.kill(pid, sig)
@@ -913,90 +911,35 @@ def send_signal(proc, sig, group=False):
             os.close(fd)
 
 
-def group_alive(pgid):
-    """True while any non-zombie process is in process group pgid."""
-    try:
-        names = os.listdir("/proc")
-    except OSError:
-        return False
-    for name in names:
-        if name.isdigit():
-            st = proc_stat(name)
-            if st and st[1] == pgid and st[0] not in ("Z", "X"):
-                return True
-    return False
-
-
-def group_members(worker):
-    """[(pid, start)] of the live processes in the capture worker's process
-    group (it leads one: pgid == its pid), alive or not the worker itself.
-
-    Ours only: owned by us and started no earlier than the worker. If the
-    worker's pid now belongs to a different process that leads a group of
-    its own (pid reused), that group is someone else's: []. Otherwise every
-    member of pgid == worker pid descends from our worker (a group id only
-    exists while its leader's pid is taken), e.g. a grim the worker left
-    behind when it died."""
-    pgid, since = worker
-    if since is None:
-        return []
-    lead = proc_stat(pgid)
-    if lead and lead[2] != since and lead[1] == pgid:
-        return []
-    out, uid = [], os.getuid()
-    try:
-        names = os.listdir("/proc")
-    except OSError:
-        return out
-    for name in names:
-        if not name.isdigit():
-            continue
-        st = proc_stat(name)
-        if not st or st[1] != pgid or st[0] in ("Z", "X") or st[2] < since:
-            continue
-        try:
-            if os.stat(f"/proc/{name}").st_uid != uid:
-                continue
-        except OSError:
-            continue
-        out.append((int(name), st[2]))
-    return out
-
-
 def stop_procs(recorders, worker=None, timeout=5.0):
     """Stop a session's processes; bounded and never raises.
 
     recorders: [(pid, start)] get SIGINT (pw-record finalizes the WAV).
-    worker: (pid, start) of screens-loop. Every member of its process group
-    (group_members: the worker and any grim/hyprctl it runs, including ones
-    it left behind if it already died) gets SIGTERM, each by identity, so
-    a reaped leader's group id is never signalled blindly. Anything still
-    alive after timeout gets SIGKILL. Processes whose identity no longer
-    matches (exited, PID reused) are never signalled. A legacy worker
-    without a start time only gets the old leader-checked group signal.
+    worker: (pid, start) of screens-loop gets SIGTERM; its handler kills
+    the grim/hyprctl it is running and exits. Only these identity-checked
+    processes are ever signalled -- never the worker's process group (a
+    group id can be reused). A capture child cannot outlive the worker:
+    it gets SIGKILL when the worker dies (CaptureRunner, PR_SET_PDEATHSIG).
+    Anything still alive after timeout gets SIGKILL. Processes whose
+    identity no longer matches (exited, PID reused) are never signalled.
     """
-    legacy = bool(worker) and worker[1] is None
-    if legacy:
-        send_signal(worker, signal.SIGTERM, group=True)
-    members = group_members(worker) if worker and not legacy else []
-    for m in members:
-        send_signal(m, signal.SIGTERM)
     live = [p for p in recorders if send_signal(p, signal.SIGINT)]
-    ours = [p for p, _ in live] + [p for p, _ in members]
+    if worker and send_signal(worker, signal.SIGTERM):
+        live.append(worker)
+    ours = [p for p, _ in live]
     deadline = time.monotonic() + timeout
     while True:
         reap(ours)
         live = [p for p in live if pid_alive(*p)]
-        members = group_members(worker) if worker and not legacy else []
-        if not live and not members:
+        if not live:
             return
         if time.monotonic() >= deadline:
             break
         time.sleep(0.1)
-    for p in live + members:
+    for p in live:
         send_signal(p, signal.SIGKILL)
     time.sleep(0.1)
-    reap(ours + [p for p, _ in members])
+    reap(ours)
 
 
 def notify(title, body=""):
@@ -1179,6 +1122,10 @@ def active_jobs():
 # Exit code of start/stop/toggle when another transition holds the lock
 # (EX_TEMPFAIL): the watcher retries instead of treating the call as handled.
 BUSY = 75
+# Exit code of start when a device probe failed transiently (pactl timed
+# out / failed, e.g. PipeWire restarting): the watcher retries it a bounded
+# number of times while the call lasts.
+RETRY = 76
 
 
 def cmd_start(args=(), source="manual"):
@@ -1192,9 +1139,17 @@ def cmd_start(args=(), source="manual"):
     except TimeoutError as e:
         print(f"busy: {e}", file=sys.stderr)
         return BUSY
-    for state in stale:      # mixing a crashed session never holds the lock
-        finish_session(state, cfg, recovered=True)
+    finally:
+        finish_stale(stale, cfg)
     return rc
+
+
+def finish_stale(stale, cfg):
+    """Mix crashed sessions that start/toggle recovered (with the lock
+    released) -- also when the new start failed or raised: recovery already
+    cleared them from session.json, nothing else would ever save them."""
+    for state in stale:
+        finish_session(state, cfg, recovered=True)
 
 
 def start_settings(cfg):
@@ -1232,9 +1187,18 @@ def start_locked(cfg, source, stale=None):
 
     try:
         settings = start_settings(cfg)
+    except (ValueError, configparser.Error) as e:
+        notify("Meeting recorder: could not start", str(e))
+        print(f"cannot start: {e}", file=sys.stderr)
+        return 1
+    try:
         sink, mic = pactl_default("sink"), pactl_default("source")
-    except (ValueError, configparser.Error, OSError,
-            subprocess.SubprocessError) as e:
+    except subprocess.SubprocessError as e:     # timed out / failed: transient
+        if source != "teams":       # the watcher notifies when it gives up
+            notify("Meeting recorder: could not start", str(e))
+        print(f"cannot start (will retry): {e}", file=sys.stderr)
+        return RETRY
+    except OSError as e:
         notify("Meeting recorder: could not start", str(e))
         print(f"cannot start: {e}", file=sys.stderr)
         return 1
@@ -1263,8 +1227,6 @@ def start_locked(cfg, source, stale=None):
     # Unique per session: the raw dir and the id the screens worker checks.
     session_id = f"{int(time.time())}-{os.urandom(3).hex()}"
     sess_dir = os.path.join(CACHE_DIR, session_id)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    make_private_dir(sess_dir)          # call audio + screenshots: 0700
     sys_wav = os.path.join(sess_dir, "sys.wav")
     mic_wav = os.path.join(sess_dir, "mic.wav")
     base = ["pw-record", "--channels", "1", "--rate", rate]
@@ -1273,6 +1235,8 @@ def start_locked(cfg, source, stale=None):
     # any failure (or exception) stops what was spawned and removes the raw
     # dir, so nothing runs untracked by session.json.
     try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        make_private_dir(sess_dir)      # call audio + screenshots: 0700
         # Taken immediately before audio starts (after all the slow probes):
         # wall time names the folder, the monotonic origin times the frames.
         start_unix, origin = int(time.time()), time.monotonic()
@@ -1938,12 +1902,28 @@ def folder_segments(folder):
         return parse_md_transcript(f.read(), labels), True
 
 
+def die_with_parent():
+    """preexec_fn: the child gets SIGKILL when this process dies (Linux
+    PR_SET_PDEATHSIG), or exits at once if it already has."""
+    parent = os.getpid()
+    try:
+        prctl = ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return None
+
+    def preexec():
+        prctl(1, signal.SIGKILL)            # PR_SET_PDEATHSIG
+        if os.getppid() != parent:
+            os._exit(1)
+    return preexec
+
+
 class CaptureRunner:
     """Runs one capture subprocess (hyprctl / grim) at a time with a hard
-    timeout. kill() -- called from the stop signal handler -- ends the
-    running one at once. The children stay in the worker's process group,
-    which `stop` signals as a whole, so none can outlive a stop even if the
-    worker itself is SIGKILLed."""
+    timeout (<= 10 s). kill() -- called from the stop signal handler --
+    ends the running one at once (also one spawned while the signal was
+    being handled). Each child gets PR_SET_PDEATHSIG = SIGKILL, so it dies
+    with the worker even if the worker itself is SIGKILLed or crashes."""
 
     def __init__(self, env):
         self.env, self.proc, self.stopping = env, None, False
@@ -1953,8 +1933,10 @@ class CaptureRunner:
             raise RuntimeError("stopping")
         p = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             env=self.env)
+                             env=self.env, preexec_fn=die_with_parent())
         self.proc = p
+        if self.stopping:        # the stop signal arrived during the spawn
+            p.kill()
         try:
             out, err = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -2286,9 +2268,8 @@ def cmd_toggle(args=()):
     except TimeoutError as e:
         print(f"busy: {e}", file=sys.stderr)
         return BUSY
-    # Mixing (stopped or crashed session) happens with the lock released.
-    for state in stale:
-        finish_session(state, cfg, recovered=True)
+    finally:            # mixing a crashed session: lock released, always
+        finish_stale(stale, cfg)
     if rc is not None:
         return rc
     return finish_session(stopped, cfg) if stopped else 1
@@ -2353,6 +2334,9 @@ def cmd_status(args=()):
     return 0
 
 
+START_RETRIES, START_RETRY_SECONDS = 10, 60.0
+
+
 def cmd_watch(args=()):
     """Daemon: record automatically while a watched app (Teams) is in a call.
 
@@ -2364,6 +2348,7 @@ def cmd_watch(args=()):
     seen_since = None      # when the call was first seen
     gone_since = None      # when the call was last seen ending
     handled = False        # this call was already recorded (or declined)
+    retries, first_try = 0, None   # transient start failures in this call
     cfg_mtime = 0
     while True:
         try:
@@ -2396,8 +2381,20 @@ def cmd_watch(args=()):
             elif (not handled and auto_enabled(cfg) and now - seen_since
                     >= cfg.getfloat("auto", "start_after_seconds")):
                 # busy (another transition held the lock): try again next
-                # poll instead of skipping the rest of this call
-                handled = cmd_start(source="teams") != BUSY
+                # poll instead of skipping the rest of this call; a
+                # transient probe failure: same, at most START_RETRIES
+                # times / START_RETRY_SECONDS, then give up for this call
+                rc = cmd_start(source="teams")
+                if rc == RETRY:
+                    retries, first_try = retries + 1, first_try or now
+                    if (retries >= START_RETRIES
+                            or now - first_try >= START_RETRY_SECONDS):
+                        notify("Meeting recorder: could not start recording",
+                               "Audio devices did not respond; this call is "
+                               "not being recorded.")
+                        handled = True
+                else:
+                    handled = rc != BUSY
         else:
             seen_since = None
             if handled or live:
@@ -2413,6 +2410,7 @@ def cmd_watch(args=()):
                         handled, gone_since = False, None
             else:
                 handled, gone_since = False, None
+            retries, first_try = 0, None
 
         write_json(WATCH_FILE, {"pid": os.getpid(), "beat": int(now),
                                 "in_call": in_call})

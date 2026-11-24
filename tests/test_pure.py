@@ -9,12 +9,14 @@ import importlib.machinery
 import importlib.util
 import contextlib
 import datetime
+import errno
 import html
 import io
 import json
 import os
 import random
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -1427,35 +1429,25 @@ class TestProcessIdentity(StateDirMixin, unittest.TestCase):
         mr.stop_procs([(p.pid, start)], timeout=2)
         self.assertIsNotNone(p.wait(timeout=2))
 
-    def test_worker_group_is_killed_with_its_grim(self):
-        # a worker that ignores SIGTERM and has a child (think: grim)
-        p, start = self.child("trap '' TERM; sleep 60 & wait", group=True)
+    def test_stubborn_worker_is_killed_and_its_group_never_signalled(self):
+        # a worker that ignores SIGTERM, plus another process in its group:
+        # stop SIGKILLs the verified worker only -- no group enumeration
+        # (a reused group id must never authorize a signal; fix round 5)
+        pidfile = os.path.join(self.d, "member.pid")
+        p, start = self.child(f"trap '' TERM; sleep 60 & echo $! > {pidfile}; wait",
+                              group=True)
         time.sleep(0.1)
-        self.assertEqual(len(mr.group_members((p.pid, start))), 2)
+        member = int(Path(pidfile).read_text())
+        self.addCleanup(lambda: mr.pid_alive(member) and os.kill(member, 9))
         t0 = time.monotonic()
         mr.stop_procs([], (p.pid, start), timeout=0.5)
         self.assertLess(time.monotonic() - t0, 3)
-        self.assertEqual(mr.group_members((p.pid, start)), [])
+        self.assertIsNotNone(p.wait(timeout=2))
+        self.assertTrue(mr.pid_alive(member))     # not ours to signal by group
+        self.assertFalse(hasattr(mr, "group_members"))
 
-    def test_dead_worker_still_has_its_grim_killed(self):
-        # Codex: the worker died first, its identity check failed and stop
-        # skipped the group, leaving grim running
-        pidfile = os.path.join(self.d, "grim.pid")
-        p, start = self.child(f"sleep 60 & echo $! > {pidfile}; exit 0", group=True)
-        p.wait()                                   # the worker is gone (reaped)
-        grim = int(Path(pidfile).read_text())
-        self.addCleanup(lambda: mr.pid_alive(grim) and os.kill(grim, 9))
-        self.assertTrue(mr.pid_alive(grim))
-        mr.stop_procs([], (p.pid, start), timeout=1)
-        deadline = time.time() + 3
-        while mr.pid_alive(grim) and time.time() < deadline:
-            time.sleep(0.05)
-        self.assertFalse(mr.pid_alive(grim))
-
-    def test_reused_group_leader_is_not_signalled(self):
-        # the worker's pid now leads someone else's group (other start time)
+    def test_reused_worker_pid_is_not_signalled(self):
         p, start = self.child(group=True)
-        self.assertEqual(mr.group_members((p.pid, start + 1)), [])
         mr.stop_procs([], (p.pid, start + 1), timeout=0.3)
         self.assertIsNone(p.poll())
 
@@ -1729,6 +1721,84 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
                 mr.cmd_watch()
         self.assertEqual(start.call_count, 2)          # busy -> tried again
 
+    def watch_polls(self, n, start_side_effect):
+        """Run cmd_watch for n in-call polls with cmd_start mocked."""
+        Path(mr.CONFIG_FILE).write_text(
+            "[auto]\nstart_after_seconds = 0\npoll_seconds = 0.5\n")
+        ticks, notes = [], []
+
+        class Done(Exception):
+            pass
+
+        def fake_sleep(s):
+            ticks.append(s)
+            if len(ticks) >= n:
+                raise Done
+        with mock.patch.object(mr, "call_active", lambda cfg: True), \
+                mock.patch.object(mr, "cmd_start",
+                                  side_effect=start_side_effect) as start, \
+                mock.patch.object(mr, "notify", lambda *a: notes.append(a)), \
+                mock.patch.object(mr.time, "sleep", fake_sleep):
+            with self.assertRaises(Done):
+                mr.cmd_watch()
+        return start, notes
+
+    def test_watcher_retries_a_timed_out_probe(self):
+        # Codex: one pactl timeout made start return 1 and the watcher
+        # skipped the rest of the call. The real start is used: the first
+        # probe times out, the second attempt records.
+        self.start_env(spawn=lambda *a: None)
+        probes = [subprocess.TimeoutExpired(["pactl"], 5)]
+
+        def check_output(*a, **k):
+            if probes:
+                raise probes.pop(0)
+            return "default\n"
+        real_start, rcs = mr.cmd_start, []
+        with mock.patch.object(mr.subprocess, "check_output", check_output):
+            start, notes = self.watch_polls(
+                3, lambda **kw: rcs.append(real_start(**kw)) or rcs[-1])
+        self.assertEqual(rcs, [mr.RETRY, 0])          # retried, then recorded
+        self.assertEqual(start.call_count, 2)         # live -> no third start
+        self.assertTrue(mr.session_live(mr.read_state()))
+        self.assertFalse([n for n in notes if "could not" in n[0]])
+
+    def test_watcher_gives_up_after_bounded_retries(self):
+        start, notes = self.watch_polls(15, lambda **kw: mr.RETRY)
+        self.assertEqual(start.call_count, mr.START_RETRIES)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("could not start", notes[0][0])
+
+    def test_failed_start_still_finalizes_the_recovered_session(self):
+        # Codex: recovery cleared the crashed session, then the new staging
+        # dir failed (ENOSPC) and the old recording was never mixed
+        for cmd in (mr.cmd_start, mr.cmd_toggle):
+            self.start_env()
+            rec, rstart = self.child("exit 0")
+            rec.wait()
+            mr.write_state({"id": "old", "pids": [rec.pid],
+                            "pid_starts": {str(rec.pid): rstart}})
+            calls = []
+            with mock.patch.object(mr, "make_private_dir",
+                                   side_effect=OSError(errno.ENOSPC, "full")), \
+                    mock.patch.object(mr, "finish_session",
+                                      lambda st, cfg, **kw: calls.append(
+                                          (st["id"], kw)) or 0):
+                self.assertEqual(cmd(), 1, cmd.__name__)
+            self.assertEqual(calls, [("old", {"recovered": True})], cmd.__name__)
+            self.assertIsNone(mr.read_state())
+            # and when the new start raises instead of failing cleanly
+            mr.write_state({"id": "old2", "pids": [rec.pid],
+                            "pid_starts": {str(rec.pid): rstart}})
+            calls.clear()
+            with mock.patch.object(mr, "start_settings",
+                                   side_effect=KeyboardInterrupt), \
+                    mock.patch.object(mr, "finish_session",
+                                      lambda st, cfg, **kw: calls.append(st["id"])):
+                with self.assertRaises(KeyboardInterrupt):
+                    cmd()
+            self.assertEqual(calls, ["old2"], cmd.__name__)
+
     def test_auto_toggle_writes_only_its_key(self):
         self.assertEqual(mr.cmd_auto(["off"]), 0)
         text = Path(mr.CONFIG_FILE).read_text()
@@ -1912,6 +1982,30 @@ class TestScreensWorkerProcess(unittest.TestCase):
         self.assertEqual(self.group_size(w.pid), 0)
         self.assertEqual(oct(stat.S_IMODE(os.stat(os.path.join(self.raw, "screens"))
                                           .st_mode)), oct(0o700))
+
+    def test_grim_dies_with_a_killed_worker(self):
+        # no group signalling any more: a SIGKILLed worker's grim must still
+        # not linger (PR_SET_PDEATHSIG)
+        self.script("grim", "exec sleep 100")
+        _, w = self.start()
+        self.assertTrue(self.wait_for(lambda: self.group_size(w.pid) >= 2))
+        os.kill(w.pid, signal.SIGKILL)
+        w.wait()
+        self.assertTrue(self.wait_for(lambda: self.group_size(w.pid) == 0))
+
+    def test_stop_signal_during_spawn_kills_the_new_child(self):
+        runner = mr.CaptureRunner(None)
+        real_popen = subprocess.Popen
+
+        def popen_then_signal(*a, **kw):
+            p = real_popen(*a, **kw)
+            runner.kill()             # the handler ran before self.proc = p
+            return p
+        t0 = time.monotonic()
+        with mock.patch.object(mr.subprocess, "Popen", popen_then_signal):
+            with self.assertRaises(RuntimeError):
+                runner.run(["sleep", "60"], timeout=10)
+        self.assertLess(time.monotonic() - t0, 2)
 
     def test_exits_by_itself_when_recorders_die(self):
         self.script("grim", "printf 'P6\\n2 2\\n255\\n'; head -c 12 /dev/zero")

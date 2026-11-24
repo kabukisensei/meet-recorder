@@ -132,7 +132,10 @@ rmdir'd only when empty; dry-run is the default.
 - The loop exits by itself (checked every ~1 s, 3 misses) when its raw dir
   is gone, session.json no longer has its `id`, or no audio recorder is
   alive any more. hyprctl/grim run one at a time with hard timeouts (5 s /
-  10 s) in the worker's process group; SIGTERM kills the running one at once.
+  10 s); SIGTERM kills the running one at once (also one spawned while the
+  handler ran). Each gets `PR_SET_PDEATHSIG = SIGKILL`, so it dies with the
+  worker even if the worker is SIGKILLed or crashes (the timeouts are
+  enforced by the worker, so they alone would not bound an orphan).
   Full frames come from `grim … -` (stdout) and are written by us 0600, so
   there are never grim-made partial files.
 - Disk: a frame is skipped (logged) past `max_mb` (300) of frames or when the
@@ -243,12 +246,12 @@ rmdir'd only when empty; dry-run is the default.
   start time differs (PID reuse) or that is a zombie is dead; signals go via
   pidfd after the identity check. Signalling errors are printed, never
   raised, so finalization always runs.
-- `stop_procs`: recorders SIGINT, worker group SIGTERM, wait 5 s, SIGKILL
-  survivors. The worker group is handled member by member
-  (`group_members`: pgid == worker pid, our uid, started no earlier than the
-  worker; nothing if the worker's pid now leads another group), each
-  signalled by identity, so a grim left behind by a dead worker is still
-  killed and a reaped leader's bare pgid is never signalled. The watcher
+- `stop_procs`: recorders SIGINT, worker SIGTERM, wait 5 s, SIGKILL
+  survivors -- only those identity-checked pids. Fix round 5 removed the
+  process-group enumeration (`group_members`): a group id can be reused
+  between any check and the scan, so it could authorize signals to an
+  unrelated process (Codex). Capture children are instead bound to the
+  worker's lifetime (PDEATHSIG, above). The watcher
   reaps its children every poll and recovers a session whose recorders
   died as soon as it notices.
 - Lock scope (fix round 4): audio mixing never runs under the lock. `stop`,
@@ -257,7 +260,18 @@ rmdir'd only when empty; dry-run is the default.
   is mixed after the new recording started). Commands run under it are
   bounded (`pactl get-default-*` 5 s, `run_json` 5 s, `notify-send` 5 s).
   Busy = exit 75 (`BUSY`); the watcher retries a busy start/stop next poll
-  instead of marking the call handled.
+  instead of marking the call handled. A `pactl get-default-*` that times
+  out or fails is transient: start exits 76 (`RETRY`) and the watcher
+  retries every poll while the call lasts, at most `START_RETRIES` (10)
+  times / `START_RETRY_SECONDS` (60 s), then notifies "could not start
+  recording" and leaves the call alone (fix round 5; one timeout used to
+  skip the whole call). A manual start notifies at once.
+- A crashed session that start/toggle recovered is mixed in a `finally`
+  (`finish_stale`), so a new start that fails (ENOSPC on the staging dir)
+  or raises never strands it; the staging dir is created inside start's
+  guarded block, so that failure is a clean exit 1. Not persisted across
+  process death (if start itself is killed mid-way, the WAVs stay in
+  `~/.cache/meet-recorder/<id>/`).
 - The watcher stops by identity: `cmd_stop(expect_id=…, expect_source=
   "teams")` re-checks both under the lock and stops nothing if a manual
   recording replaced its Teams one in the meantime.
