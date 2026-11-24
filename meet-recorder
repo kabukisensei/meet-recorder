@@ -3069,13 +3069,30 @@ def cmd_screens_loop(args=()):
 # Manual snap (Task 9): `meet-recorder snap [--window focused]`
 # --------------------------------------------------------------------------- #
 
-SNAP_APP = "Meeting snap"              # notify-send app name (mako styling)
+SNAP_APP = "Meeting snap"              # notify-send fallback app name
 SNAP_CATEGORY = "meet-recorder.snap"   # notify-send category
+# Omarchy's own sender (app "omarchy-action") shows through Do Not Disturb;
+# plain notify-send popups are silenced by the Omarchy shell under DND.
+SNAP_OMARCHY = "omarchy-notification-send"
+SNAP_GLYPH = "\U000F0100"              # nerd-font camera
 
 
 def notify_snap(ok, title, body, image=None):
     """The visual confirmation of a snap: a short notification with the
-    saved frame as its image, or a critical one when nothing was saved."""
+    saved frame as its image, or a longer one when nothing was saved.
+    Uses omarchy-notification-send (bypasses DND) when present; falls back
+    to notify-send if it is missing or fails."""
+    if shutil.which(SNAP_OMARCHY):
+        argv = [SNAP_OMARCHY, "-g", SNAP_GLYPH]
+        argv += ["-t", "2500"] if ok else ["-u", "normal", "-t", "6000"]
+        if image:
+            argv += ["--image", image]
+        try:
+            if subprocess.run(argv + [title, body], check=False, timeout=5,
+                              stdin=subprocess.DEVNULL).returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
     argv = ["notify-send", "-a", SNAP_APP, "-c", SNAP_CATEGORY,
             "-t", "2500" if ok else "6000"]
     if image:

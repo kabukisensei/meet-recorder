@@ -557,7 +557,12 @@ against a real mic. Until then `mic_source = raw`.
 - Visual signal: `notify_snap` -> `notify-send -a "Meeting snap" -c
   meet-recorder.snap -t 2500 -i <jpg> -h string:image-path:<jpg> "Screen
   saved" "mm:ss · <title>"`; failure: `-u critical -t 6000 "Screen NOT
-  saved — <reason>"`. Mako can style it by app-name/category.
+  saved — <reason>"`. Fix 11: the Omarchy shell silences notify-send under
+  DND (the user's normal state), so `omarchy-notification-send -g <camera>
+  -t 2500 [--image <jpg>]` (failure: `-u normal -t 6000`, never critical =
+  sticky; no `--app-name`, default `omarchy-action` bypasses DND) goes
+  first; the notify-send argv above is the fallback if it is missing,
+  exits non-zero, errors or times out (5 s).
 - `status --json` gains `snaps` / `last_snap_unix` (`session_snaps`: manual
   entries in the live manifest; unix = start + t). Panel.qml flashes
   `● MM:SS  <camera> N` for 2 s when `snaps` rises between polls (1 s while

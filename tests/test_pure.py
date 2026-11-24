@@ -3108,6 +3108,9 @@ esac""")
         self.script("notify-send",
                     f"for a in \"$@\"; do printf '%s\\n' \"$a\"; done >> {self.notes}; "
                     f"echo --- >> {self.notes}")
+        # shadow the real Omarchy sender (no real toasts from tests); its
+        # failure exercises the notify-send fallback end to end
+        self.script("omarchy-notification-send", "exit 1")
         self.cfg = make_cfg(self.d, "[screens]\nmax_mb = 300\nmin_free_mb = 0\n")
         self.state_dir = os.path.join(self.d, ".local", "state", "meet-recorder")
         os.makedirs(self.state_dir)
@@ -3220,6 +3223,68 @@ esac""")
         note = self.notifications()[0]
         self.assertIn("critical", note)
         self.assertTrue(note[-2].startswith("Screen NOT saved — grim failed"))
+
+
+class TestNotifySnap(unittest.TestCase):
+    """Fix 11: omarchy-notification-send (bypasses DND) first, notify-send
+    as the fallback. subprocess.run is mocked: nothing is ever shown."""
+    OLD_OK = ["notify-send", "-a", "Meeting snap", "-c", "meet-recorder.snap",
+              "-t", "2500", "-i", "/f.jpg", "-h", "string:image-path:/f.jpg",
+              "Screen saved", "01:05 · Call"]
+
+    def send(self, ok, title, body, image=None, which=True, rc=0, exc=None):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(argv)
+            self.assertEqual(kw.get("timeout"), 5)
+            if argv[0] == mr.SNAP_OMARCHY:
+                if exc:
+                    raise exc
+                return subprocess.CompletedProcess(argv, rc)
+            return subprocess.CompletedProcess(argv, 0)
+        path = "/usr/bin/" + mr.SNAP_OMARCHY if which else None
+        with mock.patch.object(mr.shutil, "which", lambda name: path), \
+                mock.patch.object(mr.subprocess, "run", run):
+            mr.notify_snap(ok, title, body, image)
+        return calls
+
+    def test_omarchy_success(self):
+        calls = self.send(True, "Screen saved", "01:05 · Call", "/f.jpg")
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv, [mr.SNAP_OMARCHY, "-g", "\U000F0100", "-t", "2500",
+                                "--image", "/f.jpg", "Screen saved", "01:05 · Call"])
+        self.assertNotIn("--app-name", argv)
+        self.assertNotIn("critical", argv)
+
+    def test_omarchy_no_image(self):
+        argv = self.send(True, "Screen saved", "b")[0]
+        self.assertNotIn("--image", argv)
+
+    def test_omarchy_failure_toast(self):
+        argv = self.send(False, "Screen NOT saved — not recording", "")[0]
+        self.assertEqual(argv[:7], [mr.SNAP_OMARCHY, "-g", "\U000F0100",
+                                    "-u", "normal", "-t", "6000"])
+        self.assertEqual(argv[-2], "Screen NOT saved — not recording")
+        self.assertNotIn("critical", argv)
+        self.assertNotIn("--app-name", argv)
+
+    def test_sender_missing_uses_old_argv(self):
+        calls = self.send(True, "Screen saved", "01:05 · Call", "/f.jpg",
+                          which=False)
+        self.assertEqual(calls, [self.OLD_OK])
+        calls = self.send(False, "Screen NOT saved — x", "", which=False)
+        self.assertEqual(calls, [["notify-send", "-a", "Meeting snap", "-c",
+                                  "meet-recorder.snap", "-t", "6000", "-u",
+                                  "critical", "Screen NOT saved — x", ""]])
+
+    def test_sender_fails_falls_back(self):
+        for kw in ({"rc": 1}, {"exc": OSError("gone")},
+                   {"exc": subprocess.TimeoutExpired("x", 5)}):
+            calls = self.send(True, "Screen saved", "01:05 · Call", "/f.jpg", **kw)
+            self.assertEqual(calls[0][0], mr.SNAP_OMARCHY, kw)
+            self.assertEqual(calls[1:], [self.OLD_OK], kw)
 
 
 class TestManualFramesDownstream(unittest.TestCase):

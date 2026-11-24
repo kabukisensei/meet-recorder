@@ -183,8 +183,10 @@ focused` saves the active window instead). Within half a second you get a
 "Screen saved" notification showing the captured image and `mm:ss · <window
 title>`, and the bar shows a camera with the number of snaps next to the red
 timer for ~2 s. If nothing could be saved (not recording, no Teams window,
-disk/budget limits) you get a critical "Screen NOT saved — <reason>"
-notification instead. Snapped frames are marked "📌 marked by you" in
+disk/budget limits) you get a "Screen NOT saved — <reason>"
+notification instead. On Omarchy these go through `omarchy-notification-send`,
+so they show even with Do Not Disturb on; elsewhere (or if it fails) plain
+`notify-send` is used. Snapped frames are marked "📌 marked by you" in
 `moments.md` and preferred by `link-screens`. `install-local.sh` adds the
 binding to `~/.config/hypr/bindings.lua` once, next to the Super+Shift+R
 toggle (`install-hypr-bind.sh`; falls back to Super+Shift+U if Super+Alt+R is
