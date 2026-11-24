@@ -15,6 +15,9 @@ Here is a meeting transcript with timestamps. Produce:
 1. A 3-5 sentence summary of what was discussed.
 2. Action items as a markdown checkbox list (owner in parentheses if mentioned).
 3. Key decisions made, as bullets.
+End every action item and every decision with the timestamp of the transcript
+line it came from, written as [mm:ss] (the start of that line's [mm:ss -> mm:ss]),
+e.g. "- [ ] Move the ticket to DevOps (Tanner) [12:34]".
 If the transcript is too sparse to summarize, say exactly: TRANSCRIPT_TOO_SPARSE
 
 --- TRANSCRIPT ---
@@ -32,3 +35,11 @@ if [ "$out" = "TRANSCRIPT_TOO_SPARSE" ]; then
 fi
 printf "%s\n" "$out" | tee "$dir/summary.md"
 echo "written: $dir/summary.md"
+
+# Link each [mm:ss]-tagged line to the screen frame showing at that moment
+# (local post-processing only; images are never sent to agy).
+if [ -f "$dir/screens.json" ]; then
+  mr="$(dirname "$0")/meet-recorder"
+  [ -x "$mr" ] || mr=meet-recorder
+  "$mr" link-screens "$dir" >/dev/null || echo "link-screens failed (summary kept)" >&2
+fi

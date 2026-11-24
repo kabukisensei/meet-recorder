@@ -11,6 +11,7 @@ unit=~/.config/systemd/user/meet-recorder-watch.service
 
 install -m 755 meet-recorder        ~/.local/bin/meet-recorder.py
 install -m 755 meet-recorder-wrapper ~/.local/bin/meet-recorder
+install -m 755 meet-recorder-summarize ~/.local/bin/meet-recorder-summarize
 install -d "$plugin"
 install -m 644 omarchy-widget/Panel.qml      "$plugin/Panel.qml"
 install -m 644 omarchy-widget/manifest.json  "$plugin/manifest.json"
@@ -26,4 +27,4 @@ systemctl --user restart meet-recorder-watch.service
 # Hot-reload keeps the old compiled QML; a shell restart reliably picks up the widget.
 omarchy restart shell >/dev/null 2>&1 || true
 
-echo "synced: CLI -> ~/.local/bin, bar widget -> omarchy plugin dir, watch service + shell restarted"
+echo "synced: CLI + summarizer -> ~/.local/bin, bar widget -> omarchy plugin dir, watch service + shell restarted"

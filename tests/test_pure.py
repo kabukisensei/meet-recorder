@@ -552,5 +552,243 @@ class TestVttConsumerContract(unittest.TestCase):
         self.assertEqual(ids, ["1", "2", "3"])
 
 
+def ppm(w, h, fill=0, patch=None, header=None):
+    """Synthetic P6 bytes: all channels = fill, optional (x, y, value) pixels."""
+    px = bytearray([fill] * (w * h * 3))
+    for x, y, v in patch or []:
+        i = (y * w + x) * 3
+        px[i:i + 3] = bytes([v, v, v])
+    return (header or f"P6\n{w} {h}\n255\n".encode()) + bytes(px)
+
+
+class TestThumbDiff(unittest.TestCase):
+    def test_parse_with_comment(self):
+        w, h, mx, px = mr.parse_ppm(ppm(2, 1, 7, header=b"P6\n# grim\n2 1\n255\n"))
+        self.assertEqual((w, h, mx, px), (2, 1, 255, bytes([7] * 6)))
+
+    def test_identical_is_zero_and_full_flip_is_one(self):
+        a = mr.parse_ppm(ppm(4, 4, 0))
+        self.assertEqual(mr.thumb_diff(a, mr.parse_ppm(ppm(4, 4, 0))), 0.0)
+        self.assertEqual(mr.thumb_diff(a, mr.parse_ppm(ppm(4, 4, 255))), 1.0)
+
+    def test_partial_change_is_mean_abs_fraction(self):
+        a = mr.parse_ppm(ppm(10, 10, 0))
+        b = mr.parse_ppm(ppm(10, 10, 0, patch=[(0, 0, 255), (5, 5, 51)]))
+        self.assertAlmostEqual(mr.thumb_diff(a, b), (255 + 51) / (100 * 255))
+
+    def test_size_change_is_total_difference(self):
+        self.assertEqual(mr.thumb_diff(mr.parse_ppm(ppm(4, 4)),
+                                       mr.parse_ppm(ppm(4, 5))), 1.0)
+
+    def test_rejects_bad_input(self):
+        for data in (b"P3\n1 1\n255\n0 0 0", b"P6\n2 2\n255\n\x00",
+                     b"P6\nx y\n255\n", b""):
+            with self.assertRaises(ValueError, msg=repr(data)):
+                mr.parse_ppm(data)
+
+
+P = {"change_threshold": 0.005, "stable_threshold": 0.002, "settle_ticks": 2,
+     "min_gap_seconds": 10, "max_frames": 300}
+
+
+def run_keeps(frames, params=P, interval=3.0):
+    """Drive the keep rule like screens-loop does; frames are scalar 'images'
+    (diff = |a - b|; None = window missing). Returns kept tick times."""
+    state, prev, kept, times = dict(mr.SCREEN_KEEP_START), None, None, []
+    for i, f in enumerate(frames):
+        t = i * interval
+        if f is None:
+            prev = None
+            continue
+        d_prev = abs(f - prev) if prev is not None else None
+        d_kept = abs(f - kept) if kept is not None else None
+        prev = f
+        state, keep = mr.screen_keep_step(state, d_prev, d_kept, t, params)
+        if keep:
+            kept = f
+            times.append(t)
+    return times
+
+
+class TestKeepRule(unittest.TestCase):
+    def test_static_slide_kept_once_after_settling(self):
+        self.assertEqual(run_keeps([0.5] * 20), [6.0])   # ticks 0,1,2 -> keep at 2
+
+    def test_live_video_keeps_nothing(self):
+        video = [0.3 + 0.01 * ((i * 7) % 5) for i in range(100)]
+        self.assertEqual(run_keeps(video), [])
+
+    def test_slide_change_kept_after_settle(self):
+        frames = [0.1] * 8 + [0.4] * 8 + [0.7] * 8
+        self.assertEqual(run_keeps(frames), [6.0, 30.0, 54.0])
+
+    def test_tiny_change_is_not_new(self):
+        frames = [0.1] * 8 + [0.103] * 8   # settles, but < change_threshold
+        self.assertEqual(run_keeps(frames), [6.0])
+
+    def test_min_gap_delays_keep(self):
+        # second slide settles 3 s after the first keep; waits for the gap
+        frames = [0.1] * 3 + [0.5] * 10
+        p = dict(P, settle_ticks=1, min_gap_seconds=10)
+        self.assertEqual(run_keeps(frames, p), [3.0, 15.0])
+
+    def test_max_frames(self):
+        frames = []
+        for k in range(10):
+            frames += [k / 10] * 5
+        self.assertEqual(len(run_keeps(frames, dict(P, max_frames=3))), 3)
+        self.assertEqual(len(run_keeps(frames)), 10)
+
+    def test_missing_window_resets_settling(self):
+        frames = [0.1, 0.1, None, 0.1, 0.1, 0.1]
+        self.assertEqual(run_keeps(frames), [15.0])
+
+    def test_pure(self):
+        s = dict(mr.SCREEN_KEEP_START)
+        mr.screen_keep_step(s, 0.0, None, 0, P)
+        self.assertEqual(s, mr.SCREEN_KEEP_START)
+
+
+class TestScreenHelpers(unittest.TestCase):
+    def test_file_names_sort_by_time(self):
+        names = [mr.screen_file_name(t) for t in (5.04, 61.0, 123.4, 3725.25)]
+        self.assertEqual(names[2], "00123.4s.jpg")
+        self.assertEqual(names, sorted(names))
+
+    def test_pick_window_prefers_meeting_title(self):
+        clients = [
+            {"class": "teams-for-linux", "title": "Chat | Microsoft Teams",
+             "stableId": "a", "size": [2000, 1000]},
+            {"class": "teams-for-linux", "title": "Weekly sync | Microsoft Teams",
+             "stableId": "b", "size": [400, 300]},
+            {"class": "firefox", "title": "Meeting notes", "stableId": "c"}]
+        self.assertEqual(mr.pick_screen_window(clients, "teams-for-linux")["stableId"], "b")
+        self.assertEqual(mr.pick_screen_window(clients[:1], "teams-for-linux")["stableId"], "a")
+        self.assertIsNone(mr.pick_screen_window(clients, "zoom"))
+        self.assertIsNone(mr.pick_screen_window([], "teams-for-linux"))
+        unmapped = [dict(clients[0], mapped=False)]
+        self.assertIsNone(mr.pick_screen_window(unmapped, "teams-for-linux"))
+
+    def test_jpeg_size(self):
+        sof = b"\xff\xc0\x00\x11\x08" + (720).to_bytes(2, "big") + (1280).to_bytes(2, "big")
+        data = b"\xff\xd8" + b"\xff\xe0\x00\x04ab" + sof + b"\x00" * 12
+        self.assertEqual(mr.jpeg_size(data), (1280, 720))
+        self.assertEqual(mr.jpeg_size(b"nope"), (0, 0))
+
+    def test_screen_config_defaults_and_bad_values(self):
+        p = mr.screen_params(mr.load_config("/nonexistent/path.ini"))
+        self.assertEqual((p["window_class"], p["interval_seconds"], p["settle_ticks"],
+                          p["min_gap_seconds"], p["max_frames"], p["jpeg_quality"]),
+                         ("teams-for-linux", 3.0, 2, 10.0, 300, 80))
+        with tempfile.TemporaryDirectory() as d:
+            cfg = mr.load_config(make_cfg(d, "[screens]\nenabled = maybe\n"
+                                          "settle_ticks = lots\n"))
+            self.assertTrue(mr.screens_enabled(cfg))
+            self.assertEqual(mr.screen_params(cfg)["settle_ticks"], 2)
+
+
+class TestCollectScreens(unittest.TestCase):
+    def test_moves_frames_and_skips_torn_or_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            raw, out = os.path.join(d, "raw"), os.path.join(d, "out")
+            os.makedirs(os.path.join(raw, "screens"))
+            os.makedirs(out)
+            for name in ("00012.0s.jpg", "00003.0s.jpg"):
+                Path(raw, "screens", name).write_bytes(b"jpg")
+            Path(raw, "screens.jsonl").write_text(
+                '{"t": 12.0, "file": "00012.0s.jpg", "window_title": "B", "w": 1, "h": 1}\n'
+                '{"t": 3.0, "file": "00003.0s.jpg", "window_title": "A", "w": 1, "h": 1}\n'
+                '{"t": 20.0, "file": "00020.0s.jpg"}\n'          # image missing
+                '{"t": 30.0, "fi')                               # torn write
+            self.assertEqual(mr.collect_screens(raw, out), 2)
+            frames = json.loads(Path(out, "screens.json").read_text())
+            self.assertEqual([f["file"] for f in frames], ["00003.0s.jpg", "00012.0s.jpg"])
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "screens"))),
+                             ["00003.0s.jpg", "00012.0s.jpg"])
+
+    def test_no_frames_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(mr.collect_screens(os.path.join(d, "nope"), d), 0)
+            self.assertEqual(os.listdir(d), [])
+
+
+class TestMoments(unittest.TestCase):
+    SEGS = [seg(0.0, 10.0, "intro"), seg(55.0, 59.0, "before window", "Me"),
+            seg(60.0, 75.0, "overlaps start", "Others"),
+            seg(100.0, 104.5, "right at the frame", "Me"),
+            seg(119.9, 121.0, "just inside after"), seg(120.5, 130.0, "after window")]
+
+    def test_window_is_30s_before_to_15s_after(self):
+        got = [d["text"] for d in mr.moment_segments(self.SEGS, 105.0)]
+        self.assertEqual(got, ["overlaps start", "right at the frame",
+                               "just inside after"])
+
+    def test_sorted_and_empty(self):
+        segs = [seg(10, 11, "b"), seg(5, 6, "a")]
+        self.assertEqual([d["text"] for d in mr.moment_segments(segs, 8)], ["a", "b"])
+        self.assertEqual(mr.moment_segments([], 8), [])
+        self.assertEqual(mr.moment_segments(segs, 500), [])
+
+    def test_render(self):
+        frames = [{"t": 105.0, "file": "00105.0s.jpg", "window_title": "Q4 review"},
+                  {"t": 600.0, "file": "00600.0s.jpg", "window_title": ""}]
+        md = mr.render_moments(frames, self.SEGS)
+        self.assertIn("## 01:45 — Q4 review\n\n![screen 01:45](screens/00105.0s.jpg)\n", md)
+        self.assertIn("- [01:40 -> 01:44] Me: right at the frame\n", md)
+        self.assertIn("## 10:00 — Screen\n", md)
+        self.assertIn("_No transcript lines around this moment._", md)
+
+    def test_write_moments_only_with_frames(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(mr.write_moments(d, self.SEGS))
+            Path(d, "screens.json").write_text(json.dumps(
+                [{"t": 105.0, "file": "00105.0s.jpg", "window_title": "X"}]))
+            self.assertTrue(mr.write_moments(d, self.SEGS).endswith("moments.md"))
+
+
+FRAMES = [{"t": 30.0, "file": "00030.0s.jpg"}, {"t": 100.0, "file": "00100.0s.jpg"},
+          {"t": 200.0, "file": "00200.0s.jpg"}]
+
+
+class TestLinkScreens(unittest.TestCase):
+    def test_pick_frame(self):
+        self.assertEqual(mr.pick_frame(FRAMES, 110)["t"], 100.0)   # latest at/before
+        self.assertEqual(mr.pick_frame(FRAMES, 100)["t"], 100.0)   # exactly at t
+        self.assertEqual(mr.pick_frame(FRAMES, 190)["t"], 100.0)   # 90 s back, inclusive
+        self.assertEqual(mr.pick_frame(FRAMES, 191)["t"], 200.0)   # else nearest after
+        self.assertEqual(mr.pick_frame(FRAMES, 20)["t"], 30.0)
+        self.assertIsNone(mr.pick_frame(FRAMES, 10))               # 20 s before first
+        self.assertIsNone(mr.pick_frame([], 100))
+
+    def test_links_and_idempotent(self):
+        text = ("# Summary\n\nWe talked [01:00 -> 01:05] about it.\n\n"
+                "- [ ] Move ticket to DevOps (Tanner) [01:50]\n"
+                "- Decided to ship Friday [00:20]\n"
+                "- Unrelated [55:00]\r\n"
+                "- Long call [1:02:03]\n")
+        frames = FRAMES + [{"t": 3700.0, "file": "03700.0s.jpg"}]
+        once = mr.link_screens(text, frames)
+        self.assertIn("(Tanner) [01:50] — [screen 01:40](screens/00100.0s.jpg)\n", once)
+        self.assertIn("ship Friday [00:20] — [screen 00:30](screens/00030.0s.jpg)\n", once)
+        self.assertIn("- Unrelated [55:00]\r\n", once)              # no frame in window
+        self.assertIn("[1:02:03] — [screen 61:40](screens/03700.0s.jpg)", once)
+        self.assertIn("We talked [01:00 -> 01:05] about it.\n", once)  # ranges ignored
+        self.assertEqual(mr.link_screens(once, frames), once)
+
+    def test_no_frames_is_noop(self):
+        text = "- [ ] Something [01:50]\n"
+        self.assertEqual(mr.link_screens(text, []), text)
+
+    def test_cmd_link_screens(self):
+        with tempfile.TemporaryDirectory() as d, \
+                contextlib.redirect_stdout(io.StringIO()):
+            Path(d, "summary.md").write_text("- [ ] Do it [01:45]\n")
+            Path(d, "screens.json").write_text(json.dumps(FRAMES))
+            self.assertEqual(mr.cmd_link_screens([d]), 0)
+            self.assertEqual(mr.cmd_link_screens([d]), 0)
+            self.assertEqual(Path(d, "summary.md").read_text(),
+                             "- [ ] Do it [01:45] — [screen 01:40](screens/00100.0s.jpg)\n")
+
+
 if __name__ == "__main__":
     unittest.main()

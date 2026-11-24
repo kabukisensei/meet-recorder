@@ -21,7 +21,10 @@ import time
 STATE_DIR = os.path.expanduser("~/.local/state/meet-recorder")
 STATE_FILE = os.path.join(STATE_DIR, "session.json")
 CACHE_DIR = os.path.expanduser("~/.cache/meet-recorder")
-CONFIG_FILE = os.path.expanduser("~/.config/meet-recorder/config.ini")
+# MEET_RECORDER_CONFIG points at an alternative config (scratch/testing);
+# child processes (transcribe, screens-loop) inherit it.
+CONFIG_FILE = os.path.expanduser(os.environ.get("MEET_RECORDER_CONFIG")
+                                  or "~/.config/meet-recorder/config.ini")
 JOBS_DIR = os.path.join(STATE_DIR, "transcribing")   # one marker per running job
 LAST_FILE = os.path.join(STATE_DIR, "last.json")     # most recent finished session
 WATCH_FILE = os.path.join(STATE_DIR, "watch.json")   # heartbeat of the auto-recorder
@@ -42,7 +45,19 @@ DEFAULTS = {
     # apps opens the microphone (i.e. a call is live) and stops when it closes.
     "auto": {"enabled": "true", "apps": "teams", "poll_seconds": "2",
              "start_after_seconds": "4", "stop_after_seconds": "20"},
+    # Screen moments: while recording, keep a frame of the call window each
+    # time its content changes and then settles (slides, shared docs).
+    # Thresholds are mean absolute pixel difference of a small thumbnail,
+    # as a fraction 0-1 (see NOTES.md for why these values).
+    "screens": {"enabled": "true", "window_class": "teams-for-linux",
+                "interval_seconds": "3", "change_threshold": "0.005",
+                "stable_threshold": "0.002", "settle_ticks": "2",
+                "min_gap_seconds": "10", "max_frames": "300",
+                "jpeg_quality": "80"},
 }
+
+# Thumbnail width (px) used to compare frames; small keeps the loop cheap.
+SCREEN_THUMB_WIDTH = 160
 
 
 # --------------------------------------------------------------------------- #
@@ -314,6 +329,212 @@ def pick_meeting_title(titles):
     return ""
 
 
+def clean_window_title(title):
+    """Window title without the ' | Microsoft Teams' suffix."""
+    return re.sub(r"\s*\|\s*Microsoft Teams\s*$", "", title or "").strip()
+
+
+def pick_screen_window(clients, window_class):
+    """The window to capture: a mapped client whose class contains
+    window_class (case-insensitive); with several, the most meeting-like
+    title (pick_meeting_title), else the largest. None if there is none."""
+    want = (window_class or "").strip().lower()
+    if not want:
+        return None
+    cands = [c for c in clients or []
+             if want in str(c.get("class", "")).lower()
+             and c.get("mapped", True) and c.get("stableId")]
+    if not cands:
+        return None
+    best = pick_meeting_title([c.get("title", "") for c in cands])
+    if best:
+        for c in cands:
+            if clean_window_title(c.get("title", "")) == best:
+                return c
+
+    def area(c):
+        size = c.get("size") or [0, 0]
+        return size[0] * size[1]
+    return max(cands, key=area)
+
+
+def parse_ppm(data):
+    """Parse a binary PPM (P6) -> (width, height, maxval, pixel bytes).
+
+    Raises ValueError on anything else (or truncated pixel data).
+    """
+    pos, tokens = 0, []
+    if data[:2] != b"P6":
+        raise ValueError("not a P6 PPM")
+    pos = 2
+    while len(tokens) < 3:
+        while pos < len(data) and data[pos:pos + 1].isspace():
+            pos += 1
+        if data[pos:pos + 1] == b"#":           # comment to end of line
+            while pos < len(data) and data[pos:pos + 1] not in (b"\n", b"\r"):
+                pos += 1
+            continue
+        start = pos
+        while pos < len(data) and data[pos:pos + 1].isdigit():
+            pos += 1
+        if start == pos:
+            raise ValueError("bad PPM header")
+        tokens.append(int(data[start:pos]))
+    w, h, maxval = tokens
+    pos += 1                                     # single whitespace byte
+    if not (w > 0 and h > 0 and 0 < maxval < 256):
+        raise ValueError("unsupported PPM dimensions/maxval")
+    pixels = data[pos:pos + w * h * 3]
+    if len(pixels) != w * h * 3:
+        raise ValueError("truncated PPM")
+    return w, h, maxval, pixels
+
+
+def thumb_diff(a, b):
+    """Mean absolute pixel difference of two parsed PPMs, as a fraction 0-1.
+    Different sizes (window resized) count as completely different (1.0)."""
+    if a[:2] != b[:2] or not a[3]:
+        return 1.0
+    total = sum(abs(x - y) for x, y in zip(a[3], b[3]))
+    return total / (len(a[3]) * max(a[2], b[2]))
+
+
+def screen_params(cfg):
+    """[screens] settings as numbers; a bad value falls back to the default."""
+    out = {}
+    for key, conv in (("interval_seconds", float), ("change_threshold", float),
+                      ("stable_threshold", float), ("settle_ticks", int),
+                      ("min_gap_seconds", float), ("max_frames", int),
+                      ("jpeg_quality", int)):
+        try:
+            out[key] = conv(cfg.get("screens", key))
+        except (ValueError, configparser.Error):
+            out[key] = conv(DEFAULTS["screens"][key])
+    out["interval_seconds"] = max(0.5, out["interval_seconds"])
+    out["jpeg_quality"] = min(100, max(1, out["jpeg_quality"]))
+    out["window_class"] = cfg.get("screens", "window_class",
+                                  fallback="").strip()
+    return out
+
+
+def screens_enabled(cfg):
+    try:
+        return cfg.getboolean("screens", "enabled", fallback=True)
+    except ValueError:
+        return True
+
+
+SCREEN_KEEP_START = {"stable": 0, "kept": 0, "last_keep": None}
+
+
+def screen_keep_step(state, d_prev, d_kept, t, p):
+    """One tick of the "new and settled" keep rule. Returns (state, keep).
+
+    d_prev: diff to the previous tick's thumbnail (None: no previous tick).
+    d_kept: diff to the last kept frame (None: nothing kept yet).
+    A frame is kept when it differs from the last kept one by more than
+    change_threshold, has been stable (d_prev < stable_threshold) for
+    settle_ticks consecutive ticks, min_gap_seconds have passed since the
+    last keep and fewer than max_frames were kept. Live video never settles,
+    so camera-only stretches keep nothing.
+    """
+    stable = (state["stable"] + 1
+              if d_prev is not None and d_prev < p["stable_threshold"] else 0)
+    new = d_kept is None or d_kept > p["change_threshold"]
+    gap_ok = (state["last_keep"] is None
+              or t - state["last_keep"] >= p["min_gap_seconds"])
+    keep = (new and stable >= p["settle_ticks"] and gap_ok
+            and state["kept"] < p["max_frames"])
+    state = dict(state, stable=stable)
+    if keep:
+        state.update(kept=state["kept"] + 1, last_keep=t)
+    return state, keep
+
+
+def screen_file_name(offset):
+    """Sortable frame file name for an offset in seconds: '00123.4s.jpg'."""
+    return f"{max(0.0, offset):07.1f}s.jpg"
+
+
+def jpeg_size(data):
+    """(width, height) from a JPEG's SOF marker, or (0, 0) if not found."""
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            h = int.from_bytes(data[i + 5:i + 7], "big")
+            w = int.from_bytes(data[i + 7:i + 9], "big")
+            return w, h
+        i += 2 + seg_len
+    return 0, 0
+
+
+def moment_segments(segments, t, before=30.0, after=15.0):
+    """Segment dicts overlapping [t - before, t + after], in time order."""
+    lo, hi = t - before, t + after
+    hits = [d for d in segments if d["end"] >= lo and d["start"] <= hi]
+    return sorted(hits, key=lambda d: (d["start"], d["end"]))
+
+
+def render_moments(frames, segments):
+    """moments.md: one section per kept frame, with the image and what was
+    said from 30 s before to 15 s after it."""
+    out = ["# Screen moments", ""]
+    for f in sorted(frames, key=lambda f: f["t"]):
+        title = " ".join(str(f.get("window_title") or "Screen").split())
+        out += [f"## {fmt_ts(f['t'])} — {title}", "",
+                f"![screen {fmt_ts(f['t'])}](screens/{f['file']})", ""]
+        lines = [format_segment(d["start"], d["end"], " ".join(
+            d["text"].split()), d.get("speaker", ""))
+            for d in moment_segments(segments, f["t"])]
+        out += ["- " + l for l in lines] or ["_No transcript lines around "
+                                             "this moment._"]
+        out.append("")
+    return "\n".join(out)
+
+
+_SUMMARY_TS = re.compile(r"\[(?:(\d+):)?(\d+):([0-5]\d)\]")
+
+
+def pick_frame(frames, t, before=90.0, after=15.0):
+    """Frame for a summary timestamp: the latest one in [t - before, t],
+    else the earliest in (t, t + after]; None if neither exists."""
+    earlier = [f for f in frames if t - before <= f["t"] <= t]
+    if earlier:
+        return max(earlier, key=lambda f: f["t"])
+    later = [f for f in frames if t < f["t"] <= t + after]
+    return min(later, key=lambda f: f["t"]) if later else None
+
+
+def link_screens(text, frames):
+    """Append a screen link to each summary line ending in a '[mm:ss]'
+    reference that has a frame nearby (pick_frame). Idempotent: lines that
+    already link a screen are left alone."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        nl = line[len(body):]
+        refs = list(_SUMMARY_TS.finditer(body))
+        if refs and "](screens/" not in body:
+            h, m, s = refs[-1].groups()
+            f = pick_frame(frames, int(h or 0) * 3600 + int(m) * 60 + int(s))
+            if f:
+                body = (body.rstrip() + f" — [screen {fmt_ts(f['t'])}]"
+                        f"(screens/{f['file']})")
+        out.append(body + nl)
+    return "".join(out)
+
+
 def load_config(path=None):
     """Load config, merging any existing file over the built-in defaults.
 
@@ -460,6 +681,33 @@ def meeting_title(cfg):
     return pick_meeting_title(titles)
 
 
+def hypr_env(env=None):
+    """Environment for hyprctl/grim. Inherited when we run inside the
+    graphical session; otherwise derive the Hyprland instance signature and
+    Wayland socket from $XDG_RUNTIME_DIR (newest instance wins)."""
+    env = dict(os.environ if env is None else env)
+    runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = runtime
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        base = os.path.join(runtime, "hypr")
+        try:
+            sigs = [d for d in os.listdir(base) if os.path.exists(
+                os.path.join(base, d, ".socket.sock"))]
+        except OSError:
+            sigs = []
+        if sigs:
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = max(
+                sigs, key=lambda d: os.path.getmtime(os.path.join(base, d)))
+    if not env.get("WAYLAND_DISPLAY"):
+        try:
+            socks = sorted(n for n in os.listdir(runtime)
+                           if re.fullmatch(r"wayland-\d+", n))
+        except OSError:
+            socks = []
+        env["WAYLAND_DISPLAY"] = socks[0] if socks else "wayland-1"
+    return env
+
+
 def read_json(path):
     try:
         with open(path) as f:
@@ -577,6 +825,12 @@ def cmd_start(args=(), source="manual"):
                "pw-record failed to open the speaker or microphone.")
         print("failed to start recorders", file=sys.stderr)
         return 1
+    if screens_enabled(cfg):
+        screens_pid = spawn_screens(sess_dir)
+        if screens_pid:
+            state = read_state() or {}
+            state["screens_pid"] = screens_pid
+            write_state(state)
     notify("● Recording started",
            (title or ("Teams call" if source == "teams" else "Manual recording"))
            + "\nStop: click the mic icon in the bar, or Super+Shift+R")
@@ -684,6 +938,7 @@ def finalize_audio(state, cfg):
                             "48k", os.path.join(folder, name)],
                            check=False, **quiet)
 
+    n_screens = collect_screens(sess_dir, folder)
     # Raw WAVs are disposable once the mix succeeds.
     shutil.rmtree(sess_dir, ignore_errors=True)
 
@@ -696,8 +951,104 @@ def finalize_audio(state, cfg):
         "mic_device": state.get("mic", ""),
         "audio": "meeting.m4a", "transcript": "transcript.md",
         "transcript_status": "pending",
+        "screens": n_screens,
     })
     return folder
+
+
+def read_screens_jsonl(raw_dir):
+    """Frames recorded by screens-loop whose image exists, sorted by t.
+    Tolerates a torn last line (the loop may be killed mid-write)."""
+    frames = []
+    try:
+        with open(os.path.join(raw_dir, "screens.jsonl"), encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return frames
+    for line in lines:
+        try:
+            d = json.loads(line)
+            float(d["t"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if (isinstance(d.get("file"), str) and "/" not in d["file"]
+                and os.path.isfile(os.path.join(raw_dir, "screens", d["file"]))):
+            frames.append(d)
+    return sorted(frames, key=lambda d: d["t"])
+
+
+def collect_screens(raw_dir, folder):
+    """Move kept frames into <folder>/screens/ and write screens.json.
+    Returns the frame count; never raises (screens must not cost audio)."""
+    try:
+        frames = read_screens_jsonl(raw_dir)
+        if frames:
+            dest = os.path.join(folder, "screens")
+            os.makedirs(dest, exist_ok=True)
+            for d in frames:
+                shutil.move(os.path.join(raw_dir, "screens", d["file"]),
+                            os.path.join(dest, d["file"]))
+            write_json(os.path.join(folder, "screens.json"), frames)
+        log = os.path.join(raw_dir, "screens.log")
+        if os.path.exists(log) and os.path.getsize(log):
+            shutil.move(log, os.path.join(folder, "screens.log"))
+        return len(frames)
+    except Exception as e:
+        print(f"collecting screens failed: {e}", file=sys.stderr)
+        return 0
+
+
+def spawn_screens(sess_dir):
+    """Start the detached screens-loop for a raw session dir; pid or None."""
+    try:
+        log = open(os.path.join(sess_dir, "screens.log"), "a")
+        p = subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                              "screens-loop", sess_dir],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
+        log.close()
+        return p.pid
+    except OSError:
+        return None
+
+
+def load_folder_segments(folder):
+    """Segment dicts for a session folder: segments.json if usable, else
+    parsed transcript.md, else []."""
+    try:
+        with open(os.path.join(folder, "segments.json"), encoding="utf-8") as f:
+            segs = validate_segments(json.load(f))
+        if segs:
+            return segs
+    except (OSError, ValueError):
+        pass
+    meta = read_json(os.path.join(folder, "meta.json"))
+    labels = bool(meta.get("speaker_labels")) if isinstance(meta, dict) else None
+    try:
+        with open(os.path.join(folder, "transcript.md"), encoding="utf-8") as f:
+            return parse_md_transcript(f.read(), labels)
+    except (OSError, ValueError):
+        return []
+
+
+def read_frames(folder):
+    """screens.json of a session folder ([] if missing or malformed)."""
+    frames = read_json(os.path.join(folder, "screens.json"))
+    if not isinstance(frames, list):
+        return []
+    return [f for f in frames if isinstance(f, dict)
+            and isinstance(f.get("t"), (int, float)) and isinstance(f.get("file"), str)]
+
+
+def write_moments(folder, segments):
+    """Write moments.md if the folder has screen frames; returns its path
+    (None when there are no frames)."""
+    frames = read_frames(folder)
+    if not frames:
+        return None
+    path = os.path.join(folder, "moments.md")
+    write_text_atomic(path, render_moments(frames, segments))
+    return path
 
 
 def spawn_summary(cmd, folder):
@@ -734,8 +1085,11 @@ def cmd_stop(args=()):
     if state is None:
         print("Not recording.", file=sys.stderr)
         return 1
+    pids = list(state.get("pids", []))
+    if isinstance(state.get("screens_pid"), int):
+        pids.append(state["screens_pid"])
     try:
-        terminate(state.get("pids", []))
+        terminate(pids)
     finally:
         clear_state()
     try:
@@ -782,6 +1136,11 @@ def cmd_transcribe(args=()):
         export_err = write_transcripts(folder, segments, start, duration,
                                        meta.get("title", ""), cfg)
         status = "done" if segments else "no-speech"
+        try:
+            write_moments(folder, segment_dicts(segments))
+        except Exception as e:   # never fails the transcription
+            print(f"moments.md failed: {e}\nretry: meet-recorder moments "
+                  f"{folder}", file=sys.stderr)
         if export_err:
             # transcript.md/.txt are fine; only the FocusTime files failed.
             print(f"export failed: {export_err}\n"
@@ -859,6 +1218,159 @@ def export_folder(folder, cfg):
     if segs is None:
         raise FileNotFoundError("no segments.json or transcript.md to export")
     return write_vtt(folder, segs, cfg)
+
+
+def grab_thumb(stable_id, width, env):
+    """Tiny PPM thumbnail of one window via grim -T (works off-screen)."""
+    scale = min(1.0, SCREEN_THUMB_WIDTH / max(1, width))
+    out = subprocess.run(["grim", "-T", stable_id, "-s", f"{scale:.4f}",
+                          "-t", "ppm", "-"], capture_output=True, timeout=10,
+                         env=env)
+    if out.returncode != 0:
+        raise RuntimeError("grim thumbnail failed: "
+                           + out.stderr.decode(errors="replace").strip())
+    return parse_ppm(out.stdout)
+
+
+def grab_frame(stable_id, path, quality, env):
+    """Full-resolution JPEG of one window, published atomically."""
+    tmp = os.path.join(os.path.dirname(path), "." + os.path.basename(path))
+    out = subprocess.run(["grim", "-T", stable_id, "-t", "jpeg",
+                          "-q", str(quality), tmp], capture_output=True,
+                         timeout=20, env=env)
+    if out.returncode != 0 or not os.path.exists(tmp):
+        raise RuntimeError("grim capture failed: "
+                           + out.stderr.decode(errors="replace").strip())
+    with open(tmp, "rb") as f:
+        w, h = jpeg_size(f.read(65536))
+    os.replace(tmp, path)
+    return w, h
+
+
+def cmd_screens_loop(args=()):
+    """Hidden: capture "new and settled" frames of the call window into
+    <raw>/screens/ until the session ends (spawned by start, stopped by stop)."""
+    if not args:
+        print("usage: meet-recorder screens-loop <session-raw-dir>",
+              file=sys.stderr)
+        return 2
+    raw = os.path.abspath(args[0])
+    shots = os.path.join(raw, "screens")
+    os.makedirs(shots, exist_ok=True)
+    try:
+        start = float(os.path.basename(raw))
+    except ValueError:
+        start = time.time()
+    p = screen_params(load_config())
+    env = hypr_env()
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+
+    stop = []
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: stop.append(1))
+
+    last_err = [None]
+
+    def log(msg):
+        """Log to screens.log; repeated identical errors are logged once."""
+        if msg == last_err[0]:
+            return
+        last_err[0] = msg
+        with open(os.path.join(raw, "screens.log"), "a") as f:
+            f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+
+    keep_state, prev, kept_thumb, orphan = dict(SCREEN_KEEP_START), None, None, 0
+    next_tick = time.monotonic()
+    while not stop:
+        # Exit when the session is over (stop, crash recovery, finalize).
+        state = read_state()
+        same = bool(state) and state.get("session_dir") == raw
+        orphan = 0 if same else orphan + 1
+        if not os.path.isdir(raw) or orphan >= 2:
+            break
+        try:
+            clients = run_json(["hyprctl", "clients", "-j"], None)
+            if clients is None:
+                raise RuntimeError("hyprctl clients failed")
+            win = pick_screen_window(clients, p["window_class"])
+            if win is None:
+                prev = None
+                log(f"no window of class {p['window_class']!r}")
+            else:
+                sid = str(win["stableId"])
+                thumb = grab_thumb(sid, (win.get("size") or [0])[0], env)
+                t = time.time() - start
+                d_prev = thumb_diff(prev, thumb) if prev else None
+                d_kept = thumb_diff(kept_thumb, thumb) if kept_thumb else None
+                prev = thumb
+                new_state, keep = screen_keep_step(keep_state, d_prev, d_kept,
+                                                   t, p)
+                keep_state = dict(keep_state, stable=new_state["stable"])
+                if keep:
+                    name = screen_file_name(t)
+                    w, h = grab_frame(sid, os.path.join(shots, name),
+                                      p["jpeg_quality"], env)
+                    keep_state, kept_thumb = new_state, thumb
+                    with open(os.path.join(raw, "screens.jsonl"), "a",
+                              encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "t": round(t, 1), "file": name,
+                            "window_title": clean_window_title(
+                                win.get("title", "")),
+                            "w": w, "h": h}) + "\n")
+                last_err[0] = None
+        except Exception as e:      # never let a bad tick end the loop
+            log(f"{type(e).__name__}: {e}")
+        next_tick += p["interval_seconds"]
+        now = time.monotonic()
+        if next_tick < now:          # fell behind (suspend etc.): resync
+            next_tick = now + p["interval_seconds"]
+        while not stop and time.monotonic() < next_tick:
+            time.sleep(min(0.25, max(0.0, next_tick - time.monotonic())))
+    return 0
+
+
+def cmd_moments(args=()):
+    """(Re)write moments.md for session folders that have screen frames."""
+    if not args:
+        print("usage: meet-recorder moments <session-folder>...", file=sys.stderr)
+        return 2
+    rc = 0
+    for arg in args:
+        folder = os.path.abspath(os.path.expanduser(arg))
+        try:
+            path = write_moments(folder, load_folder_segments(folder))
+            print(path or f"{folder}: no screens")
+        except OSError as e:
+            print(f"{folder}: moments failed: {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+
+def cmd_link_screens(args=()):
+    """Append screen links to [mm:ss]-tagged lines of <folder>/summary.md."""
+    if not args:
+        print("usage: meet-recorder link-screens <session-folder>...",
+              file=sys.stderr)
+        return 2
+    rc = 0
+    for arg in args:
+        folder = os.path.abspath(os.path.expanduser(arg))
+        path = os.path.join(folder, "summary.md")
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+            new = link_screens(text, read_frames(folder))
+            if new != text:
+                write_text_atomic(path, new)
+            print(path)
+        except OSError as e:
+            print(f"{folder}: link-screens failed: {e}", file=sys.stderr)
+            rc = 1
+    return rc
 
 
 def cmd_toggle(args=()):
@@ -973,7 +1485,9 @@ def cmd_watch(args=()):
 
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "toggle": cmd_toggle,
             "status": cmd_status, "auto": cmd_auto, "watch": cmd_watch,
-            "transcribe": cmd_transcribe, "export": cmd_export}
+            "transcribe": cmd_transcribe, "export": cmd_export,
+            "moments": cmd_moments, "link-screens": cmd_link_screens,
+            "screens-loop": cmd_screens_loop}
 
 
 def main(argv=None):
@@ -981,7 +1495,8 @@ def main(argv=None):
     if not argv or argv[0] not in COMMANDS:
         print("usage: meet-recorder start|stop|toggle|status [--json]|"
               "auto on|off|toggle|watch|transcribe <folder>|"
-              "export <folder>...", file=sys.stderr)
+              "export <folder>...|moments <folder>...|"
+              "link-screens <folder>...", file=sys.stderr)
         return 2
     return COMMANDS[argv[0]](argv[1:])
 

@@ -25,6 +25,23 @@ stop_after_seconds = 20
 me = Me
 others = Others
 
+[screens]
+# Screen moments: while recording, keep a JPEG of the call window whenever its
+# content changes and then holds still (slides, shared docs). Live video never
+# holds still, so camera-only stretches produce no frames.
+enabled = true
+window_class = teams-for-linux
+interval_seconds = 3
+# Fractions 0-1 of mean absolute pixel difference on a small thumbnail.
+# A frame is kept when it differs from the last kept one by > change_threshold
+# and differed from the previous tick by < stable_threshold for settle_ticks ticks.
+change_threshold = 0.005
+stable_threshold = 0.002
+settle_ticks = 2
+min_gap_seconds = 10
+max_frames = 300
+jpeg_quality = 80
+
 [summary]
 # Command run (detached) after a successful transcription.
 # {folder} is replaced with the session folder. Leave empty to disable.

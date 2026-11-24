@@ -20,9 +20,24 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
         │                               drop it into FocusTime (Calls → drop zone)
         ├── segments.json               every utterance with exact float start/end,
         │                               speaker ("Me", "Others" or "") and text
-        ├── meta.json                   start time, source, title, devices, model, status
+        ├── meta.json                   start time, source, title, devices, model, status,
+        │                               "screens": number of screen frames kept
+        ├── screens/                    JPEGs of the Teams window, one per screen change
+        │                               (e.g. a new slide), named by offset: 00123.4s.jpg
+        ├── screens.json                [{"t": seconds, "file", "window_title", "w", "h"}]
+        ├── moments.md                  one section per frame: image + what was said
+        │                               from 30 s before to 15 s after it
+        ├── summary.md                  AI summary (if configured); action items and
+        │                               decisions end in [mm:ss] and link the screen
+        │                               that was showing then
+        ├── screens.log                 capture errors (only if something went wrong)
         └── transcribe.log              transcription log (only useful if something failed)
 ```
+
+Screen frames are only kept when the window content changes and then holds
+still for a few seconds (slides, shared documents); live camera video never
+holds still, so camera-only stretches produce no frames. The `screens/`,
+`screens.json` and `moments.md` entries are absent when nothing was kept.
 
 - `<source>` is `teams` (started automatically when a Teams call began) or
   `manual` (started from the bar icon or Super+Shift+R).
@@ -47,6 +62,8 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
   For folders without `meta.json`, a line starting `Me: ` / `Others: ` is
   taken as that speaker (best guess); with `meta.json`, only recordings
   marked `speaker_labels` are treated as labelled.
+- Rebuild `moments.md` with `meet-recorder moments <folder>`; re-link screens
+  in a summary with `meet-recorder link-screens <folder>` (safe to repeat).
 - If `transcript.vtt` is missing after a transcription, the FocusTime export
   failed (you get a notification; transcript.md is fine). Re-run
   `meet-recorder export <folder>`.

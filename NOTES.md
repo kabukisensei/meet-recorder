@@ -8,6 +8,8 @@ with faster-whisper. Zero network/cloud use at runtime.
 
 - `meet-recorder` — the CLI (stdlib-only Python, ~300 lines, plain functions)
 - `meet-recorder-wrapper` — venv launcher installed as `~/.local/bin/meet-recorder`
+- `meet-recorder-summarize` — optional agy summarizer (`[summary] summary_cmd`),
+  installed to `~/.local/bin/`
 - `tests/` — pure unit tests; `make check` runs them
 - `omarchy-widget/` — Omarchy shell bar widget (`Panel.qml`): always-visible mic icon,
   red `● MM:SS` while recording, click for the start/stop panel
@@ -96,6 +98,55 @@ with faster-whisper. Zero network/cloud use at runtime.
   continues, exit 1 if any failed. Idempotent.
 - Validate: `ffmpeg -y -v error -i transcript.vtt -f srt /dev/null` (without
   `-y` ffmpeg refuses to "overwrite" /dev/null and still exits 0).
+
+## Screen moments (2026-11-23, Tanner's idea)
+
+- `grim -T <stableId> out.png` captures ONE window by its Hyprland `stableId`
+  (`hyprctl clients -j`), **even when its workspace is not visible**. That is
+  what makes this work without recording video. Teams class: `teams-for-linux`.
+- `start` spawns a detached hidden `screens-loop <raw-dir>` (if `[screens]
+  enabled`, default true); its pid is `screens_pid` in session.json (NOT in
+  `pids`, so a lingering loop never makes the session look live). `stop`
+  terminates it together with the recorders (same SIGINT→wait→SIGKILL). The
+  loop also exits by itself when the raw dir is gone or session.json no
+  longer names its raw dir (2 ticks in a row), so it cannot orphan.
+- Each tick (`interval_seconds`, 3): `hyprctl clients -j` → pick the window
+  (`pick_screen_window`: class substring, mapped, meeting-like title, else
+  largest) → `grim -T id -s <scale> -t ppm -` thumbnail ~160 logical px wide
+  (~200 px on this 1.25x display), parsed in plain Python (`parse_ppm`) and
+  compared by mean absolute byte difference (`thumb_diff`, 0–1).
+- Keep rule (`screen_keep_step`, pure): keep when the diff to the last kept
+  frame > `change_threshold` AND the diff to the previous tick was <
+  `stable_threshold` for `settle_ticks` ticks in a row; plus `min_gap_seconds`
+  and `max_frames`. Kept: full-res `grim -T id -t jpeg -q 80` →
+  `<raw>/screens/00123.4s.jpg` (offset from start, sortable) + a line in
+  `<raw>/screens.jsonl`. Errors go to `<raw>/screens.log` (deduplicated),
+  never crash the loop. The loop runs at nice 10.
+- Thresholds (measured 2026-11-23 on this machine): an unchanged window gives
+  a diff of exactly 0.0 (the compositor output is deterministic), so
+  `stable_threshold = 0.002` only has to absorb small animations (speaking
+  rings, a cursor) — live camera video is far above it and never settles.
+  Text-only slide changes in a small tiled terminal measured 0.003–0.007;
+  real slides / doc pages differ far more. `change_threshold = 0.005` (2.5x
+  the stable band so a settled frame cannot flap) catches those while
+  ignoring a blinking caret or a reaction pop-up.
+- Cost: one grab ≈ 20–30 ms of grim; the loop averages well under 1 % of a
+  core (see the commit's live proof).
+- `finalize_audio` moves frames to `<folder>/screens/`, writes `screens.json`
+  (array, tolerant of a torn last jsonl line) and `meta.json "screens": N`
+  before deleting the raw dir. A screens failure never costs the audio.
+- `transcribe` writes `moments.md` after the transcripts (frame image + the
+  segments overlapping [t-30 s, t+15 s], from the precise segment times);
+  rebuild with `meet-recorder moments <folder>`.
+- `meet-recorder-summarize` lives in this repo now (installed by
+  install-local.sh). Its prompt asks for `[mm:ss]` at the end of each action
+  item / decision; afterwards it runs `meet-recorder link-screens <folder>`,
+  which appends ` — [screen mm:ss](screens/<file>)` using the latest frame in
+  [t-90 s, t], else the earliest in (t, t+15 s]. Idempotent. **Images are
+  never sent to agy**, only the transcript text.
+- Testing without touching the real config: `MEET_RECORDER_CONFIG=<file>`
+  replaces `~/.config/meet-recorder/config.ini` (children inherit it); point
+  `[screens] window_class` at a test window (e.g. `foot --app-id mr-screen-test`).
 
 ## Known quirks
 

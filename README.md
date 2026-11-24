@@ -119,3 +119,15 @@ auto-records Teams calls, and `RECORDINGS.md` for the output folder layout
 commands: `status --json`, `auto on|off|toggle`, `watch`, `transcribe <folder>`,
 `export <folder>...` (backfill `transcript.vtt` + `segments.json` for older
 recordings; Teams-format WebVTT that FocusTime imports).
+
+## Screen moments
+
+While recording, a background `screens-loop` (needs `grim` + `hyprctl`) checks
+the Teams window every 3 s and keeps a JPEG whenever its content changes and
+then settles — a new slide, a shared document — but not live video. After
+transcription, `moments.md` pairs each frame with what was said around it,
+and `meet-recorder-summarize` (also in this repo) tags action items/decisions
+with `[mm:ss]` and links the matching frame (`link-screens`). Images never
+leave the machine; only transcript text goes to the summarizer. Configure in
+`[screens]` (see `config.ini.example`); `enabled = false` turns it off.
+Commands: `moments <folder>...`, `link-screens <folder>...`.
