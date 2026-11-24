@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Summarize a meet-recorder transcript with agy (Google AI Pro quota).
+# Usage: meet-recorder-summarize [path-to-meeting-dir]  (default: newest in ~/Recordings)
+set -euo pipefail
+dir="${1:-}"
+if [ -z "$dir" ]; then
+  dir=$(ls -d "$HOME"/Recordings/*/*-meeting 2>/dev/null | sort | tail -1)
+fi
+[ -n "$dir" ] || { echo "no recording found" >&2; exit 1; }
+t="$dir/transcript.md"
+[ -f "$t" ] || { echo "no transcript.md in $dir" >&2; exit 1; }
+
+prompt=$(cat <<PROMPT
+Here is a meeting transcript with timestamps. Produce:
+1. A 3-5 sentence summary of what was discussed.
+2. Action items as a markdown checkbox list (owner in parentheses if mentioned).
+3. Key decisions made, as bullets.
+If the transcript is too sparse to summarize, say exactly: TRANSCRIPT_TOO_SPARSE
+
+--- TRANSCRIPT ---
+$(cat "$t")
+PROMPT
+)
+
+out=$(env -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY \
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/1000/bus}" \
+  agy -p "$prompt")
+
+if [ "$out" = "TRANSCRIPT_TOO_SPARSE" ]; then
+  echo "transcript too sparse to summarize: $dir" >&2
+  exit 3
+fi
+printf "%s\n" "$out" | tee "$dir/summary.md"
+echo "written: $dir/summary.md"
