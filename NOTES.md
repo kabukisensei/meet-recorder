@@ -76,11 +76,26 @@ with faster-whisper. Zero network/cloud use at runtime.
   `HH:MM:SS.mmm` timings, `<v Name>text</v>` cues, `&<>` escaped) and
   `segments.json` (exact float timings for later features). FocusTime's
   Calls drop zone imports the `.vtt` as if Teams made it.
-- Voice names come from `[speakers] me` / `others` (defaults `Me` / `Others`);
+- Voice names come from `[speakers] me` / `others` (defaults `Me` / `Others`,
+  read raw so `%` is fine; blank falls back to the default);
   unlabelled segments (single-track / old recordings) use `others`.
+- Cue end is always > start: both ends are rounded to ms, then
+  `end = max(end, start + 1 ms)` (WebVTT rule). `segments.json` keeps the
+  original float timings untouched.
+- transcript.md/.txt are written first; a VTT/segments.json failure does not
+  fail transcription — it is notified/logged; retry with `export`.
+  VTT and JSON are published atomically (temp file + `os.replace`, UTF-8).
 - `meet-recorder export <folder>...` backfills old folders: uses
-  `segments.json` if present, else parses `transcript.md` (second precision).
-  Idempotent. Validate with `ffmpeg -v error -i transcript.vtt -f srt -`.
+  `segments.json` if present (validated; an empty `[]` defers to the md),
+  else parses `transcript.md` (second precision; continuation lines of a
+  multi-line utterance are kept). Speaker prefixes: `meta.json`
+  `speaker_labels: true` → `Me: ` / `Others: ` are labels; meta.json without
+  it → no labels (text kept whole); no meta.json → prefix heuristic. A
+  transcript with no `[mm:ss -> mm:ss]` rows is an error unless it is the
+  recorder's `_No speech detected._`. Bad folders are reported, the batch
+  continues, exit 1 if any failed. Idempotent.
+- Validate: `ffmpeg -y -v error -i transcript.vtt -f srt /dev/null` (without
+  `-y` ffmpeg refuses to "overwrite" /dev/null and still exits 0).
 
 ## Known quirks
 

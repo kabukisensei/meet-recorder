@@ -8,12 +8,14 @@ network calls, ever. faster-whisper is imported lazily, only at transcribe time.
 
 import configparser
 import json
+import math
 import os
 import re
 import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 STATE_DIR = os.path.expanduser("~/.local/state/meet-recorder")
@@ -60,13 +62,22 @@ def format_segment(start, end, text, speaker=""):
     return f"[{fmt_ts(start)} -> {fmt_ts(end)}] {who}{text.strip()}"
 
 
-def fmt_vtt_ts(seconds):
-    """Format seconds as WebVTT 'HH:MM:SS.mmm' (hours always present, >= 0)."""
-    ms = int(round(max(0.0, float(seconds)) * 1000))
-    h, ms = divmod(ms, 3_600_000)
+def vtt_ms(seconds):
+    """Seconds -> whole milliseconds as used in a VTT timestamp (never < 0)."""
+    return int(round(max(0.0, float(seconds)) * 1000))
+
+
+def fmt_vtt_ms(ms):
+    """Format whole milliseconds as WebVTT 'HH:MM:SS.mmm' (hours always present)."""
+    h, ms = divmod(max(0, int(ms)), 3_600_000)
     m, ms = divmod(ms, 60_000)
     s, ms = divmod(ms, 1000)
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def fmt_vtt_ts(seconds):
+    """Format seconds as WebVTT 'HH:MM:SS.mmm' (hours always present, >= 0)."""
+    return fmt_vtt_ms(vtt_ms(seconds))
 
 
 def vtt_escape(text):
@@ -89,6 +100,38 @@ def segment_dicts(segments):
     return out
 
 
+def validate_segments(segments):
+    """Check a segments.json-style list; return normalized copies.
+
+    Each item must be an object with finite numeric 'start' / 'end' and a
+    string 'text'; 'speaker' is optional (string). Raises ValueError naming
+    the first bad item.
+    """
+    if not isinstance(segments, list):
+        raise ValueError("segments must be a list")
+    out = []
+    for i, d in enumerate(segments):
+        if not isinstance(d, dict):
+            raise ValueError(f"segment {i} is not an object")
+        times = []
+        for key in ("start", "end"):
+            v = d.get(key)
+            if (isinstance(v, bool) or not isinstance(v, (int, float))
+                    or not math.isfinite(v)):
+                raise ValueError(f"segment {i}: '{key}' is not a finite number")
+            times.append(float(v))
+        text, speaker = d.get("text"), d.get("speaker", "")
+        if not isinstance(text, str):
+            raise ValueError(f"segment {i}: 'text' is not a string")
+        if speaker is None:
+            speaker = ""
+        if not isinstance(speaker, str):
+            raise ValueError(f"segment {i}: 'speaker' is not a string")
+        out.append({"start": times[0], "end": times[1],
+                    "speaker": speaker, "text": text})
+    return out
+
+
 def speaker_name(label, me="Me", others="Others"):
     """Map a segment label ('Me' / 'Others' / '') to a display name."""
     if label == "Me":
@@ -101,45 +144,81 @@ def speaker_name(label, me="Me", others="Others"):
 def segments_to_vtt(segments, me="Me", others="Others"):
     """Build a Teams-style WebVTT transcript from segment dicts.
 
-    Cues are sorted by start time, numbered from 1, empty texts are skipped,
-    and end is clamped to >= start.
+    Cues are sorted by start time, numbered from 1, and empty texts skipped.
+    Both endpoints are quantized to milliseconds first; then end is forced
+    to be strictly after start (WebVTT requires end > start), which covers
+    reversed, zero-length and same-millisecond segments. A blank voice name
+    falls back to 'Me' / 'Others' (WebVTT needs a non-empty annotation).
     """
+    me = vtt_escape(me) or "Me"
+    others = vtt_escape(others) or "Others"
     cues = []
-    ordered = sorted(segments, key=lambda d: (max(0.0, float(d["start"])),
-                                              float(d["end"])))
-    for d in ordered:
-        text = vtt_escape(d.get("text", ""))
+    timed = []
+    for d in validate_segments(segments):
+        start_ms = vtt_ms(d["start"])
+        end_ms = max(vtt_ms(d["end"]), start_ms + 1)
+        timed.append((start_ms, end_ms, d))
+    for start_ms, end_ms, d in sorted(timed, key=lambda t: (t[0], t[1])):
+        text = vtt_escape(d["text"])
         if not text:
             continue
-        start = max(0.0, float(d["start"]))
-        end = max(start, float(d["end"]))
-        name = vtt_escape(speaker_name(d.get("speaker", ""), me, others))
-        cues.append(f"{len(cues) + 1}\n{fmt_vtt_ts(start)} --> {fmt_vtt_ts(end)}\n"
-                    f"<v {name}>{text}</v>\n")
+        label = d["speaker"]
+        fallback = me if label == "Me" else others
+        name = vtt_escape(speaker_name(label, me, others)) or fallback
+        cues.append(f"{len(cues) + 1}\n{fmt_vtt_ms(start_ms)} --> "
+                    f"{fmt_vtt_ms(end_ms)}\n<v {name}>{text}</v>\n")
     return "WEBVTT\n\n" + "\n".join(cues)
 
 
-_MD_LINE = re.compile(r"^\[(\d+):(\d{2}) -> (\d+):(\d{2})\] ?(.*)$")
-_MD_SPEAKER = re.compile(r"^(Me|Others): (.*)$")
+_MD_LINE = re.compile(r"^\[(\d+):([0-5]\d) -> (\d+):([0-5]\d)\] ?(.*)$")
+_MD_SPEAKER = re.compile(r"^(Me|Others): (.*)$", re.S)
+MD_NO_SPEECH = "_No speech detected._"
 
 
-def parse_md_line(line):
+def parse_md_line(line, labels=None):
     """Parse a transcript.md/.txt line '[mm:ss -> mm:ss] [Speaker: ]text'.
 
     Returns a segment dict, or None for headers / blank / other lines.
-    Only the labels the recorder writes ('Me', 'Others') count as speakers.
+    labels: True / None -> a leading 'Me: ' / 'Others: ' (the only labels the
+    recorder writes) is taken as the speaker; False -> the folder has no
+    speaker labels (meta.json lacks speaker_labels), so the text is kept whole.
+    The label is detected before stripping so 'Me: ' (empty utterance) stays
+    an empty Me segment rather than the spoken text 'Me:'.
     """
-    m = _MD_LINE.match(line.strip())
+    m = _MD_LINE.match(line.rstrip("\r\n"))
     if not m:
         return None
     start = int(m.group(1)) * 60 + int(m.group(2))
     end = int(m.group(3)) * 60 + int(m.group(4))
-    text, speaker = m.group(5).strip(), ""
-    sm = _MD_SPEAKER.match(text)
+    text, speaker = m.group(5), ""
+    sm = _MD_SPEAKER.match(text) if labels is not False else None
     if sm:
-        speaker, text = sm.group(1), sm.group(2).strip()
+        speaker, text = sm.group(1), sm.group(2)
     return {"start": float(start), "end": float(end),
-            "speaker": speaker, "text": text}
+            "speaker": speaker, "text": text.strip()}
+
+
+def parse_md_transcript(content, labels=None):
+    """Parse a whole transcript.md/.txt into segment dicts.
+
+    Lines that follow a timestamped record (until the next one) are
+    continuation lines of that utterance (whisper text can contain newlines)
+    and are kept, newline-joined; header lines before the first record are
+    skipped. The recorder's explicit no-speech marker yields []; any other
+    input without a single record raises ValueError.
+    """
+    segs, lines = [], content.splitlines()
+    for line in lines:
+        d = parse_md_line(line, labels)
+        if d is not None:
+            segs.append(d)
+        elif segs:
+            segs[-1]["text"] += "\n" + line
+    for d in segs:
+        d["text"] = d["text"].strip()
+    if not segs and MD_NO_SPEECH not in (l.strip() for l in lines):
+        raise ValueError("no '[mm:ss -> mm:ss] text' rows found in transcript")
+    return segs
 
 
 def _words(text):
@@ -235,15 +314,24 @@ def pick_meeting_title(titles):
     return ""
 
 
-def load_config(path=CONFIG_FILE):
+def load_config(path=None):
     """Load config, merging any existing file over the built-in defaults.
 
     Missing file -> defaults; partial file -> merged with defaults.
+    path defaults to CONFIG_FILE (looked up at call time).
     """
     cfg = configparser.ConfigParser()
     cfg.read_dict(DEFAULTS)
-    cfg.read(os.path.expanduser(path))
+    cfg.read(os.path.expanduser(path or CONFIG_FILE))
     return cfg
+
+
+def speaker_names(cfg):
+    """(me, others) VTT voice names from [speakers]; read raw so a literal
+    '%' is fine, and blank names fall back to 'Me' / 'Others'."""
+    me = cfg.get("speakers", "me", raw=True, fallback="").strip()
+    others = cfg.get("speakers", "others", raw=True, fallback="").strip()
+    return me or "Me", others or "Others"
 
 
 def build_ffmpeg_mix_cmd(sys_wav, mic_wav, out_path,
@@ -380,12 +468,28 @@ def read_json(path):
         return None
 
 
+def write_text_atomic(path, text):
+    """Write UTF-8 text via a unique temp file + os.replace, so a failure
+    never leaves a truncated file or clobbers the previous version."""
+    folder = os.path.dirname(path) or "."
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp",
+                               prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=1)
-    os.replace(tmp, path)
+    write_text_atomic(path, json.dumps(data, indent=1))
 
 
 def active_jobs():
@@ -504,20 +608,26 @@ def transcribe(paths, cfg):
 
 
 def write_vtt(folder, seg_dicts, cfg):
-    """Write transcript.vtt (FocusTime / Teams format); returns its path."""
+    """Write transcript.vtt (FocusTime / Teams format); returns its path.
+
+    The VTT is rendered fully before anything touches the destination, then
+    published atomically (UTF-8), so a bad segment never erases a good file.
+    """
+    text = segments_to_vtt(seg_dicts, *speaker_names(cfg))
     path = os.path.join(folder, "transcript.vtt")
-    with open(path, "w") as f:
-        f.write(segments_to_vtt(seg_dicts,
-                                cfg.get("speakers", "me", fallback="Me"),
-                                cfg.get("speakers", "others", fallback="Others")))
+    write_text_atomic(path, text)
     return path
 
 
 def write_transcripts(folder, segments, start_unix, duration, title="",
                       cfg=None):
-    seg_dicts = segment_dicts(segments)
-    write_json(os.path.join(folder, "segments.json"), seg_dicts)
-    write_vtt(folder, seg_dicts, cfg or load_config())
+    """Write transcript.txt/.md, then the FocusTime exports.
+
+    The legacy transcripts are written first and their failure raises. An
+    export failure (segments.json / transcript.vtt) does not: it is returned
+    as an error string (None on success) so the caller can report it and the
+    user can retry with `meet-recorder export <folder>`.
+    """
     lines = [format_segment(*seg) for seg in segments]
     body = "\n".join(lines) + ("\n" if lines else "")
     with open(os.path.join(folder, "transcript.txt"), "w") as f:
@@ -526,7 +636,14 @@ def write_transcripts(folder, segments, start_unix, duration, title="",
     with open(os.path.join(folder, "transcript.md"), "w") as f:
         f.write(f"# {title or 'Meeting'} {iso}\n\n")
         f.write(f"Duration: {fmt_ts(duration)}\n\n")
-        f.write(body if body else "_No speech detected._\n")
+        f.write(body if body else MD_NO_SPEECH + "\n")
+    try:
+        seg_dicts = segment_dicts(segments)
+        write_json(os.path.join(folder, "segments.json"), seg_dicts)
+        write_vtt(folder, seg_dicts, cfg or load_config())
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return None
 
 
 def finalize_audio(state, cfg):
@@ -662,9 +779,16 @@ def cmd_transcribe(args=()):
                                               "%Y-%m-%dT%H:%M:%S"))
         except (KeyError, ValueError):
             pass
-        write_transcripts(folder, segments, start, duration,
-                          meta.get("title", ""), cfg)
+        export_err = write_transcripts(folder, segments, start, duration,
+                                       meta.get("title", ""), cfg)
         status = "done" if segments else "no-speech"
+        if export_err:
+            # transcript.md/.txt are fine; only the FocusTime files failed.
+            print(f"export failed: {export_err}\n"
+                  f"retry: meet-recorder export {folder}", file=sys.stderr)
+            notify("Meeting recorder: FocusTime export failed",
+                   f"{export_err}\nTranscript is fine. Retry: "
+                   f"meet-recorder export {folder}")
         summary_cmd = cfg.get("summary", "summary_cmd", fallback="").strip()
         if status == "done" and summary_cmd:
             spawn_summary(summary_cmd.format(folder=folder), folder)
@@ -700,24 +824,41 @@ def cmd_export(args=()):
     rc = 0
     for arg in args:
         folder = os.path.abspath(os.path.expanduser(arg))
-        seg_path = os.path.join(folder, "segments.json")
-        md_path = os.path.join(folder, "transcript.md")
-        segs = read_json(seg_path)
-        if not isinstance(segs, list):
-            segs = None
-            try:
-                with open(md_path) as f:
-                    segs = [d for d in map(parse_md_line, f) if d]
-            except OSError:
-                pass
-            if segs is None:
-                print(f"{folder}: no segments.json or transcript.md to export",
-                      file=sys.stderr)
-                rc = 1
-                continue
-            write_json(seg_path, segs)
-        print(write_vtt(folder, segs, cfg))
+        try:
+            print(export_folder(folder, cfg))
+        except (OSError, ValueError) as e:
+            print(f"{folder}: export failed: {e}", file=sys.stderr)
+            rc = 1
     return rc
+
+
+def export_folder(folder, cfg):
+    """Build transcript.vtt (and segments.json if missing) for one folder.
+
+    Source: segments.json when present and non-empty; otherwise
+    transcript.md (an empty segments.json is only trusted when the markdown
+    also says no speech). Speaker labels in the markdown are honoured per
+    meta.json's speaker_labels; folders without meta.json fall back to the
+    'Me: ' / 'Others: ' prefix heuristic. Raises OSError / ValueError.
+    """
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"not a folder: {folder}")
+    seg_path = os.path.join(folder, "segments.json")
+    md_path = os.path.join(folder, "transcript.md")
+    segs = None
+    if os.path.exists(seg_path):
+        with open(seg_path, encoding="utf-8") as f:
+            segs = validate_segments(json.load(f))
+    if not segs and os.path.exists(md_path):
+        meta = read_json(os.path.join(folder, "meta.json"))
+        labels = (bool(meta.get("speaker_labels"))
+                  if isinstance(meta, dict) else None)
+        with open(md_path, encoding="utf-8") as f:
+            segs = parse_md_transcript(f.read(), labels)
+        write_json(seg_path, segs)
+    if segs is None:
+        raise FileNotFoundError("no segments.json or transcript.md to export")
+    return write_vtt(folder, segs, cfg)
 
 
 def cmd_toggle(args=()):

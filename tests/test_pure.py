@@ -7,11 +7,16 @@ because the script has no .py extension.
 
 import importlib.machinery
 import importlib.util
+import contextlib
+import html
+import io
+import json
 import os
 import re
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI_PATH = os.path.join(HERE, "..", "meet-recorder")
@@ -223,6 +228,29 @@ def seg(start, end, text, speaker=""):
     return {"start": start, "end": end, "speaker": speaker, "text": text}
 
 
+def parse_vtt(vtt):
+    """Minimal WebVTT consumer: [(start_s, end_s, voice, decoded_text)]."""
+    blocks = vtt.split("\n\n")
+    assert blocks[0] == "WEBVTT", blocks[0]
+    cues = []
+    for block in blocks[1:]:
+        if not block.strip():
+            continue
+        lines = block.strip("\n").split("\n")
+        assert len(lines) == 3, lines
+        m = re.fullmatch(r"(\d\d):(\d\d):(\d\d)\.(\d{3}) --> "
+                         r"(\d\d):(\d\d):(\d\d)\.(\d{3})", lines[1])
+        assert m, lines[1]
+        t = [int(x) for x in m.groups()]
+        start = t[0] * 3600 + t[1] * 60 + t[2] + t[3] / 1000
+        end = t[4] * 3600 + t[5] * 60 + t[6] + t[7] / 1000
+        v = re.fullmatch(r"<v ([^>]+)>(.*)</v>", lines[2])
+        assert v, lines[2]
+        assert "-->" not in lines[2]
+        cues.append((start, end, v.group(1), html.unescape(v.group(2))))
+    return cues
+
+
 class TestSegmentsToVtt(unittest.TestCase):
     def test_exact_output(self):
         vtt = mr.segments_to_vtt([seg(0.0, 2.5, "Hi", "Others"),
@@ -253,10 +281,39 @@ class TestSegmentsToVtt(unittest.TestCase):
         self.assertLess(vtt.index("first"), vtt.index("second"))
         self.assertIn("1\n00:00:02.000", vtt)
 
-    def test_end_clamped_and_newlines_collapsed(self):
-        vtt = mr.segments_to_vtt([seg(5, 4, "line one\n\nline two")])
-        self.assertIn("00:00:05.000 --> 00:00:05.000", vtt)
+    def test_newlines_collapsed(self):
+        vtt = mr.segments_to_vtt([seg(5, 6, "line one\n\nline two")])
         self.assertIn("<v Others>line one line two</v>", vtt)
+
+    def test_end_always_after_start(self):
+        # reversed, zero-length, same-millisecond, legacy same-second
+        vtt = mr.segments_to_vtt([seg(5, 4, "rev"), seg(7, 7, "zero"),
+                                  seg(9.0001, 9.0002, "same ms"),
+                                  seg(11.0, 11.0, "legacy")])
+        self.assertIn("00:00:05.000 --> 00:00:05.001\n<v Others>rev", vtt)
+        self.assertIn("00:00:07.000 --> 00:00:07.001\n<v Others>zero", vtt)
+        self.assertIn("00:00:09.000 --> 00:00:09.001\n<v Others>same ms", vtt)
+        self.assertIn("00:00:11.000 --> 00:00:11.001\n<v Others>legacy", vtt)
+        for start, end, _, _ in parse_vtt(vtt):
+            self.assertGreater(end, start)
+
+    def test_blank_speaker_names_fall_back(self):
+        vtt = mr.segments_to_vtt([seg(0, 1, "a", "Me"), seg(1, 2, "b", "")],
+                                 me="  ", others="")
+        self.assertIn("<v Me>a</v>", vtt)
+        self.assertIn("<v Others>b</v>", vtt)
+        self.assertNotIn("<v >", vtt)
+
+    def test_rejects_malformed_segments(self):
+        for bad in ([{}], [{"start": 0, "end": 1}],
+                    [{"start": "0", "end": 1, "text": "x"}],
+                    [{"start": float("nan"), "end": 1, "text": "x"}],
+                    [{"start": 0, "end": float("inf"), "text": "x"}],
+                    [{"start": True, "end": 1, "text": "x"}],
+                    [{"start": 0, "end": 1, "text": "x", "speaker": 3}],
+                    ["nope"], {"start": 0}):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                mr.segments_to_vtt(bad)
 
     def test_speaker_name_mapping(self):
         vtt = mr.segments_to_vtt([seg(0, 1, "a", "Me"), seg(1, 2, "b", "Others"),
@@ -299,49 +356,200 @@ class TestParseMdLine(unittest.TestCase):
                      "_No speech detected._"):
             self.assertIsNone(mr.parse_md_line(line))
 
+    def test_rejects_seconds_over_59(self):
+        self.assertIsNone(mr.parse_md_line("[00:60 -> 01:00] x"))
+        self.assertIsNone(mr.parse_md_line("[00:00 -> 00:99] x"))
+
+    def test_empty_labelled_utterance(self):
+        line = mr.format_segment(1, 2, "  ", "Me")
+        self.assertEqual(line, "[00:01 -> 00:02] Me: ")
+        self.assertEqual(mr.parse_md_line(line + "\n"), seg(1.0, 2.0, "", "Me"))
+
+    def test_labels_false_keeps_text_whole(self):
+        self.assertEqual(
+            mr.parse_md_line("[00:00 -> 00:05] Me: said literally", labels=False),
+            seg(0.0, 5.0, "Me: said literally", ""))
+
     def test_roundtrip_with_format_segment(self):
         line = mr.format_segment(3725.7, 3730.2, "text", "Others")
         self.assertEqual(mr.parse_md_line(line),
                          seg(3725.0, 3730.0, "text", "Others"))
 
 
+class TestParseMdTranscript(unittest.TestCase):
+    def test_continuation_lines_kept(self):
+        line = mr.format_segment(0, 4, "first\n\nsecond", "Others")
+        md = ("# Meeting x\n\nDuration: 00:10\n\n" + line
+              + "\n[00:05 -> 00:06] Me: next\n")
+        segs = mr.parse_md_transcript(md)
+        self.assertEqual(segs, [seg(0.0, 4.0, "first\n\nsecond", "Others"),
+                                seg(5.0, 6.0, "next", "Me")])
+        self.assertEqual(parse_vtt(mr.segments_to_vtt(segs))[0][3], "first second")
+
+    def test_no_speech_marker_is_empty(self):
+        self.assertEqual(mr.parse_md_transcript(
+            "# Meeting x\n\nDuration: 00:03\n\n_No speech detected._\n"), [])
+
+    def test_zero_rows_is_invalid(self):
+        for text in ("", "# Some notes\n\nhello world\n", "[00:61 -> 01:00] x\n"):
+            with self.assertRaises(ValueError, msg=repr(text)):
+                mr.parse_md_transcript(text)
+
+
+def make_cfg(d, body="[speakers]\nme = Ser Nine\nothers = Tanner\n"):
+    """A config file under d, independent of the user's own config.ini."""
+    path = os.path.join(d, "config.ini")
+    Path(path).write_text(body)
+    return path
+
+
+class TestSpeakerNamesConfig(unittest.TestCase):
+    def test_percent_and_blank(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = mr.load_config(make_cfg(d, "[speakers]\nme = 100% Me\nothers =\n"))
+            self.assertEqual(mr.speaker_names(cfg), ("100% Me", "Others"))
+
+    def test_defaults(self):
+        cfg = mr.load_config("/nonexistent/path.ini")
+        self.assertEqual(mr.speaker_names(cfg), ("Me", "Others"))
+
+
 class TestWriteTranscripts(unittest.TestCase):
     def test_md_txt_unchanged_plus_vtt_and_segments(self):
-        import json
         segs = [(0.25, 4.75, " Hi there ", "Others"), (5.5, 7.125, "Yo", "Me")]
         cfg = mr.load_config("/nonexistent/path.ini")
         with tempfile.TemporaryDirectory() as d:
-            mr.write_transcripts(d, segs, 1_700_000_000, 65.4, "Sync", cfg)
+            self.assertIsNone(
+                mr.write_transcripts(d, segs, 1_700_000_000, 65.4, "Sync", cfg))
             body = "[00:00 -> 00:04] Others: Hi there\n[00:05 -> 00:07] Me: Yo\n"
-            self.assertEqual(open(os.path.join(d, "transcript.txt")).read(), body)
+            self.assertEqual(Path(d, "transcript.txt").read_text(), body)
             iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(1_700_000_000))
-            self.assertEqual(open(os.path.join(d, "transcript.md")).read(),
+            self.assertEqual(Path(d, "transcript.md").read_text(),
                              f"# Sync {iso}\n\nDuration: 01:05\n\n" + body)
-            self.assertEqual(json.load(open(os.path.join(d, "segments.json")))[1],
+            self.assertEqual(json.loads(Path(d, "segments.json").read_text())[1],
                              {"start": 5.5, "end": 7.125, "speaker": "Me", "text": "Yo"})
-            vtt = open(os.path.join(d, "transcript.vtt")).read()
+            vtt = Path(d, "transcript.vtt").read_text(encoding="utf-8")
             self.assertIn("00:00:05.500 --> 00:00:07.125\n<v Me>Yo</v>", vtt)
+
+    def test_export_failure_keeps_legacy_transcripts(self):
+        cfg = mr.load_config("/nonexistent/path.ini")
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "transcript.vtt"))  # cannot be replaced
+            err = mr.write_transcripts(d, [(0, 1, "hi", "Me")], 1_700_000_000,
+                                       1, "", cfg)
+            self.assertTrue(err)
+            self.assertEqual(Path(d, "transcript.txt").read_text(),
+                             "[00:00 -> 00:01] Me: hi\n")
+            self.assertTrue(Path(d, "transcript.md").read_text().endswith(
+                "[00:00 -> 00:01] Me: hi\n"))
+            self.assertEqual([p for p in os.listdir(d) if p.endswith(".tmp")], [])
 
 
 class TestExport(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.d = self._tmp.name
+        self._old_cfg = mr.CONFIG_FILE
+        mr.CONFIG_FILE = make_cfg(self.d)   # not the user's config.ini
+        self.out, self.err = io.StringIO(), io.StringIO()
+        self._stack = contextlib.ExitStack()
+        self._stack.enter_context(contextlib.redirect_stdout(self.out))
+        self._stack.enter_context(contextlib.redirect_stderr(self.err))
+
+    def tearDown(self):
+        self._stack.close()
+        mr.CONFIG_FILE = self._old_cfg
+        self._tmp.cleanup()
+
+    def folder(self, name, files):
+        path = os.path.join(self.d, name)
+        os.mkdir(path)
+        for fname, text in files.items():
+            Path(path, fname).write_text(text, encoding="utf-8")
+        return path
+
+    def vtt(self, folder):
+        return parse_vtt(Path(folder, "transcript.vtt").read_text(encoding="utf-8"))
+
     def test_backfill_from_md_and_missing(self):
-        import contextlib, io, json
+        d = self.folder("a", {"transcript.md": "# Meeting x\n\nDuration: 00:10\n\n"
+                              "[00:05 -> 00:09] Me: b\n[00:00 -> 00:04] a\n"})
+        self.assertEqual(mr.cmd_export([d]), 0)
+        first = Path(d, "transcript.vtt").read_text(encoding="utf-8")
+        self.assertEqual(mr.cmd_export([d]), 0)  # idempotent
+        self.assertEqual(Path(d, "transcript.vtt").read_text(encoding="utf-8"), first)
+        self.assertEqual([(c[2], c[3]) for c in parse_vtt(first)],
+                         [("Tanner", "a"), ("Ser Nine", "b")])  # test config names
+        self.assertEqual(len(json.loads(Path(d, "segments.json").read_text())), 2)
+        self.assertEqual(mr.cmd_export([self.folder("empty", {})]), 1)
+
+    def test_mixed_batch_continues_after_failure(self):
+        bad = self.folder("bad", {"segments.json": "[{}]"})
+        notes = self.folder("notes", {"transcript.md": "# just notes\n\nhello\n"})
+        missing = os.path.join(self.d, "missing")
+        good = self.folder("good", {"segments.json": json.dumps(
+            [seg(1.5, 2.25, "fine", "Me")])})
+        self.assertEqual(mr.cmd_export([bad, notes, missing, good]), 1)
+        err = self.err.getvalue()
+        for f in (bad, notes, missing):
+            self.assertIn(f + ": export failed", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(self.out.getvalue().split(),
+                         [os.path.join(good, "transcript.vtt")])
+        self.assertEqual(self.vtt(good), [(1.5, 2.25, "Ser Nine", "fine")])
+        self.assertFalse(os.path.exists(os.path.join(notes, "segments.json")))
+        self.assertFalse(os.path.exists(os.path.join(bad, "transcript.vtt")))
+
+    def test_bad_segments_keep_existing_vtt(self):
+        d = self.folder("keep", {"segments.json": "[{}]",
+                                 "transcript.vtt": "WEBVTT\n\nold\n"})
+        self.assertEqual(mr.cmd_export([d]), 1)
+        self.assertEqual(Path(d, "transcript.vtt").read_text(), "WEBVTT\n\nold\n")
+
+    def test_no_speech_md_exports_empty(self):
+        d = self.folder("quiet", {"transcript.md": "# Meeting x\n\nDuration: 00:02"
+                                  "\n\n_No speech detected._\n"})
+        self.assertEqual(mr.cmd_export([d]), 0)
+        self.assertEqual(Path(d, "transcript.vtt").read_text(), "WEBVTT\n\n")
+
+    def test_empty_cached_segments_retry_from_md(self):
+        d = self.folder("retry", {"segments.json": "[]", "transcript.md":
+                                  "# M\n\n[00:00 -> 00:02] Me: hello\n"})
+        self.assertEqual(mr.cmd_export([d]), 0)
+        self.assertEqual(len(self.vtt(d)), 1)
+
+    def test_meta_speaker_labels_controls_md_labels(self):
+        md = "# M\n\n[00:00 -> 00:02] Me: hello\n"
+        single = self.folder("single", {"transcript.md": md,
+                                        "meta.json": json.dumps({"source": "manual"})})
+        labelled = self.folder("labelled", {"transcript.md": md, "meta.json":
+                                            json.dumps({"speaker_labels": True})})
+        nometa = self.folder("nometa", {"transcript.md": md})
+        self.assertEqual(mr.cmd_export([single, labelled, nometa]), 0)
+        self.assertEqual(self.vtt(single)[0][2:], ("Tanner", "Me: hello"))
+        self.assertEqual(self.vtt(labelled)[0][2:], ("Ser Nine", "hello"))
+        self.assertEqual(self.vtt(nometa)[0][2:], ("Ser Nine", "hello"))  # heuristic
+
+
+class TestVttConsumerContract(unittest.TestCase):
+    def test_decoded_cues(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "transcript.md"), "w") as f:
-                f.write("# Meeting x\n\nDuration: 00:10\n\n"
-                        "[00:05 -> 00:09] Me: b\n[00:00 -> 00:04] a\n")
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(mr.cmd_export([d]), 0)
-                first = open(os.path.join(d, "transcript.vtt")).read()
-                self.assertEqual(mr.cmd_export([d]), 0)  # idempotent
-            self.assertEqual(open(os.path.join(d, "transcript.vtt")).read(), first)
-            self.assertLess(first.index(">a<"), first.index(">b<"))
-            segs = json.load(open(os.path.join(d, "segments.json")))
-            self.assertEqual(len(segs), 2)
-            empty = os.path.join(d, "empty")
-            os.mkdir(empty)
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.assertEqual(mr.cmd_export([empty]), 1)
+            cfg = mr.load_config(make_cfg(d))
+            path = mr.write_vtt(d, [
+                seg(3.25, 4.0, "second"),
+                seg(0.5, 2.0, "Tom & Jerry <b>\n\nnext --> line", "Me"),
+                seg(2.5, 3.0, " \n\t ", "Others"),        # whitespace-only: skipped
+                seg(3661.5, 3662.0, "héllo ünïcode", "Others"),
+            ], cfg)
+            raw = Path(path).read_bytes()
+        text = raw.decode("utf-8")  # valid UTF-8 regardless of locale
+        self.assertEqual(parse_vtt(text), [
+            (0.5, 2.0, "Ser Nine", "Tom & Jerry <b> next --> line"),
+            (3.25, 4.0, "Tanner", "second"),
+            (3661.5, 3662.0, "Tanner", "héllo ünïcode"),
+        ])
+        ids = [b.split("\n")[0] for b in text.split("\n\n")[1:] if b.strip()]
+        self.assertEqual(ids, ["1", "2", "3"])
 
 
 if __name__ == "__main__":

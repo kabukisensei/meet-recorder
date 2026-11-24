@@ -44,6 +44,12 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
 - Older recordings without `transcript.vtt`: `meet-recorder export <folder>...`
   builds it (and `segments.json`) from the existing transcript.
   The VTT speaker names come from `[speakers] me / others` in config.ini.
+  For folders without `meta.json`, a line starting `Me: ` / `Others: ` is
+  taken as that speaker (best guess); with `meta.json`, only recordings
+  marked `speaker_labels` are treated as labelled.
+- If `transcript.vtt` is missing after a transcription, the FocusTime export
+  failed (you get a notification; transcript.md is fine). Re-run
+  `meet-recorder export <folder>`.
 
 ## How recording works
 
