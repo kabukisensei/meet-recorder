@@ -9,6 +9,7 @@ network calls, ever. faster-whisper is imported lazily, only at transcribe time.
 import configparser
 import json
 import math
+import operator
 import os
 import re
 import signal
@@ -47,17 +48,31 @@ DEFAULTS = {
              "start_after_seconds": "4", "stop_after_seconds": "20"},
     # Screen moments: while recording, keep a frame of the call window each
     # time its content changes and then settles (slides, shared docs).
-    # Thresholds are mean absolute pixel difference of a small thumbnail,
-    # as a fraction 0-1 (see NOTES.md for why these values).
+    # Thresholds are mean absolute pixel differences (fraction 0-1) per
+    # cell of a SCREEN_GRID x SCREEN_GRID grid over a small thumbnail;
+    # cells that keep moving (camera tiles) are masked out. See
+    # screen_keep_step and NOTES.md for why these values.
     "screens": {"enabled": "true", "window_class": "teams-for-linux",
-                "interval_seconds": "3", "change_threshold": "0.005",
-                "stable_threshold": "0.002", "settle_ticks": "2",
-                "min_gap_seconds": "10", "max_frames": "300",
+                "interval_seconds": "3", "stable_threshold": "0.02",
+                "cell_change_threshold": "0.02", "change_fraction": "0.03",
+                "change_threshold": "0.005", "volatile_ticks": "3",
+                "volatile_window": "5", "max_volatile": "0.85",
+                "settle_ticks": "2", "min_gap_seconds": "10",
+                "max_frames": "300", "max_mb": "300", "min_free_mb": "1024",
                 "jpeg_quality": "80"},
 }
 
-# Thumbnail width (px) used to compare frames; small keeps the loop cheap.
-SCREEN_THUMB_WIDTH = 160
+# Thumbnail width (logical px) used to compare frames; small keeps the loop
+# cheap (~250x140 px on a 1.25x display) while a line of slide text still
+# changes a cell by far more than stable_threshold.
+SCREEN_THUMB_WIDTH = 200
+# Grid for the volatile mask. 12 x 12 = 144 cells: on that thumbnail a cell
+# is ~20x12 px (<1 % of the window), so a camera strip (>= ~10 % of the
+# height) covers whole rows of cells and masks little shared content around
+# it, while one cell still averages enough pixels that a changed text line
+# stands out clearly from a caret or a speaking ring (which only light up
+# a cell or two and become volatile anyway).
+SCREEN_GRID = 12
 
 
 # --------------------------------------------------------------------------- #
@@ -434,19 +449,53 @@ def thumb_diff(a, b):
     return total / (len(a[3]) * max(a[2], b[2]))
 
 
+def cell_diffs(a, b, grid=None):
+    """Per-cell mean absolute difference (0-1) of two parsed PPMs on a
+    grid x grid layout, row-major. None when either is missing or the sizes
+    differ (resized / other window: not comparable)."""
+    if a is None or b is None or a[:2] != b[:2] or not a[3]:
+        return None
+    grid = grid or SCREEN_GRID
+    w, h = a[0], a[1]
+    gx, gy = min(grid, w), min(grid, h)
+    xs = [(i * w // gx) * 3 for i in range(gx + 1)]     # byte offsets in a row
+    ys = [j * h // gy for j in range(gy + 1)]
+    pa, pb, row = a[3], b[3], w * 3
+    sub, out = operator.sub, []
+    for cy in range(gy):
+        sums = [0] * gx
+        for y in range(ys[cy], ys[cy + 1]):
+            off = y * row
+            for cx in range(gx):
+                s, e = off + xs[cx], off + xs[cx + 1]
+                sums[cx] += sum(map(abs, map(sub, pa[s:e], pb[s:e])))
+        rows = ys[cy + 1] - ys[cy]
+        scale = max(a[2], b[2])
+        out += [sums[cx] / (rows * (xs[cx + 1] - xs[cx]) * scale)
+                for cx in range(gx)]
+    return out
+
+
 def screen_params(cfg):
     """[screens] settings as numbers; a bad value falls back to the default."""
     out = {}
     for key, conv in (("interval_seconds", float), ("change_threshold", float),
                       ("stable_threshold", float), ("settle_ticks", int),
+                      ("cell_change_threshold", float),
+                      ("change_fraction", float), ("volatile_ticks", int),
+                      ("volatile_window", int), ("max_volatile", float),
                       ("min_gap_seconds", float), ("max_frames", int),
+                      ("max_mb", float), ("min_free_mb", float),
                       ("jpeg_quality", int)):
         try:
             out[key] = conv(cfg.get("screens", key))
+            if isinstance(out[key], float) and not math.isfinite(out[key]):
+                raise ValueError(key)
         except (ValueError, configparser.Error):
             out[key] = conv(DEFAULTS["screens"][key])
     out["interval_seconds"] = max(0.5, out["interval_seconds"])
     out["jpeg_quality"] = min(100, max(1, out["jpeg_quality"]))
+    out["volatile_window"] = max(1, out["volatile_window"])
     out["window_class"] = cfg.get("screens", "window_class",
                                   fallback="").strip()
     return out
@@ -459,31 +508,64 @@ def screens_enabled(cfg):
         return True
 
 
-SCREEN_KEEP_START = {"stable": 0, "kept": 0, "last_keep": None}
+SCREEN_KEEP_START = {"hist": (), "vol": (), "stable": 0, "kept": 0,
+                     "last_keep": None}
 
 
 def screen_keep_step(state, d_prev, d_kept, t, p):
-    """One tick of the "new and settled" keep rule. Returns (state, keep).
+    """One tick of the "new and settled" keep rule with a volatile mask.
+    Pure; returns (new state, keep).
 
-    d_prev: diff to the previous tick's thumbnail (None: no previous tick).
-    d_kept: diff to the last kept frame (None: nothing kept yet).
-    A frame is kept when it differs from the last kept one by more than
-    change_threshold, has been stable (d_prev < stable_threshold) for
-    settle_ticks consecutive ticks, min_gap_seconds have passed since the
-    last keep and fewer than max_frames were kept. Live video never settles,
-    so camera-only stretches keep nothing.
+    d_prev: per-cell diffs (cell_diffs) to the previous tick's thumbnail;
+      None = no comparable previous tick (first tick, failed sample, other
+      window, resize): the volatility history and settling restart.
+    d_kept: per-cell diffs to the last kept frame; None = nothing kept yet
+      or not comparable, which counts as new.
+
+    A cell "moved" this tick if its d_prev > stable_threshold. A cell is
+    volatile (live camera tile, speaking ring, clock, blinking caret) once
+    it moved in >= volatile_ticks of the last volatile_window ticks, and
+    stays volatile until it has not moved at all for volatile_window ticks
+    (hysteresis: low-motion video must not flicker in and out of the mask).
+    Volatile cells are ignored for both decisions:
+      settled = no calm cell moved, for settle_ticks ticks in a row;
+      new     = >= change_fraction of the calm cells differ from the kept
+                frame by > cell_change_threshold, or the calm cells' mean
+                difference is >= change_threshold.
+    More than max_volatile of the cells volatile (full-window video,
+    gallery view) keeps nothing. Then min_gap_seconds / max_frames apply.
     """
-    stable = (state["stable"] + 1
-              if d_prev is not None and d_prev < p["stable_threshold"] else 0)
-    new = d_kept is None or d_kept > p["change_threshold"]
+    if d_prev is None:
+        return dict(state, hist=(), vol=(), stable=0), False
+    n = len(d_prev)
+    moved = tuple(x > p["stable_threshold"] for x in d_prev)
+    hist = tuple(h for h in state["hist"] if len(h) == n) + (moved,)
+    hist = hist[-max(1, p["volatile_window"]):]
+    old_vol = state["vol"] if len(state["vol"]) == n else (False,) * n
+    counts = [sum(h[i] for h in hist) for i in range(n)]
+    vol = tuple(c >= p["volatile_ticks"] or (old_vol[i] and c > 0)
+                for i, c in enumerate(counts))
+    out = dict(state, hist=hist, vol=vol)
+    calm = [i for i in range(n) if not vol[i]]
+    if not calm or n - len(calm) > p["max_volatile"] * n:
+        out["stable"] = 0
+        return out, False
+    stable = 0 if any(moved[i] for i in calm) else state["stable"] + 1
+    out["stable"] = stable
+    if d_kept is None or len(d_kept) != n:
+        new = True
+    else:
+        diffs = [d_kept[i] for i in calm]
+        differ = sum(1 for x in diffs if x > p["cell_change_threshold"])
+        new = (differ >= p["change_fraction"] * len(diffs)
+               or sum(diffs) / len(diffs) >= p["change_threshold"])
     gap_ok = (state["last_keep"] is None
               or t - state["last_keep"] >= p["min_gap_seconds"])
     keep = (new and stable >= p["settle_ticks"] and gap_ok
             and state["kept"] < p["max_frames"])
-    state = dict(state, stable=stable)
     if keep:
-        state.update(kept=state["kept"] + 1, last_keep=t)
-    return state, keep
+        out.update(kept=state["kept"] + 1, last_keep=t)
+    return out, keep
 
 
 def screen_file_name(offset):
@@ -1369,6 +1451,7 @@ def cmd_screens_loop(args=()):
             f.write(time.strftime("%H:%M:%S ") + msg + "\n")
 
     keep_state, prev, kept_thumb, orphan = dict(SCREEN_KEEP_START), None, None, 0
+    prev_sid = None
     next_tick = time.monotonic()
     while not stop:
         # Exit when the session is over (stop, crash recovery, finalize).
@@ -1380,6 +1463,7 @@ def cmd_screens_loop(args=()):
         try:
             clients = run_json(["hyprctl", "clients", "-j"], None)
             if clients is None:
+                prev = None
                 raise RuntimeError("hyprctl clients failed")
             win = pick_screen_window(clients, p["window_class"])
             if win is None:
@@ -1387,14 +1471,21 @@ def cmd_screens_loop(args=()):
                 log(f"no window of class {p['window_class']!r}")
             else:
                 sid = str(win["stableId"])
-                thumb = grab_thumb(sid, (win.get("size") or [0])[0], env)
+                if sid != prev_sid:
+                    prev, prev_sid = None, sid
+                try:
+                    thumb = grab_thumb(sid, (win.get("size") or [0])[0], env)
+                except Exception:
+                    prev = None
+                    raise
                 t = time.time() - start
-                d_prev = thumb_diff(prev, thumb) if prev else None
-                d_kept = thumb_diff(kept_thumb, thumb) if kept_thumb else None
+                d_prev = cell_diffs(prev, thumb)
+                d_kept = cell_diffs(kept_thumb, thumb)
                 prev = thumb
                 new_state, keep = screen_keep_step(keep_state, d_prev, d_kept,
                                                    t, p)
-                keep_state = dict(keep_state, stable=new_state["stable"])
+                keep_state = dict(new_state, kept=keep_state["kept"],
+                                  last_keep=keep_state["last_keep"])
                 if keep:
                     name = screen_file_name(t)
                     w, h = grab_frame(sid, os.path.join(shots, name),

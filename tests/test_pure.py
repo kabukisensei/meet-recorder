@@ -12,6 +12,7 @@ import html
 import io
 import json
 import os
+import random
 import re
 import stat
 import tempfile
@@ -726,21 +727,55 @@ class TestThumbDiff(unittest.TestCase):
                 mr.parse_ppm(data)
 
 
-P = {"change_threshold": 0.005, "stable_threshold": 0.002, "settle_ticks": 2,
-     "min_gap_seconds": 10, "max_frames": 300}
+P = mr.screen_params(mr.load_config("/nonexistent/path.ini"))   # the defaults
+TW, TH = 120, 72          # synthetic thumbnail; 12x12 grid -> 10x6 px cells
+STRIP_Y = int(TH * 0.8)   # bottom 20 %: the live camera strip
+
+
+class Screen:
+    """Synthetic call window: a slide (top) + optional camera strip (bottom)."""
+
+    def __init__(self, seed=1):
+        self.rng = random.Random(seed)
+
+    def frame(self, slide, strip="random", lines=(), video=False, top_rows=None):
+        px = bytearray(TW * TH * 3)
+        for y in range(TH):
+            for x in range(TW):
+                i = (y * TW + x) * 3
+                if video:
+                    continue
+                if y >= STRIP_Y and strip != "static":
+                    continue
+                v = (x * (slide + 1) * 3 + y * 5 + slide * 40) % 200
+                if y >= STRIP_Y:
+                    v = 90 if strip == "static" else v
+                px[i:i + 3] = bytes([v, v, v])
+        for x0, y0, x1, y1 in lines:      # 'text': white blocks
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    i = (y * TW + x) * 3
+                    px[i:i + 3] = b"\xff\xff\xff"
+        noise_from = 0 if video else (STRIP_Y if strip == "random" else None)
+        if top_rows is not None:
+            noise_from = top_rows
+        if noise_from is not None:
+            a = noise_from * TW * 3
+            px[a:] = self.rng.randbytes(len(px) - a)
+        return (TW, TH, 255, bytes(px))
 
 
 def run_keeps(frames, params=P, interval=3.0):
-    """Drive the keep rule like screens-loop does; frames are scalar 'images'
-    (diff = |a - b|; None = window missing). Returns kept tick times."""
+    """Drive cell_diffs + screen_keep_step exactly like screens-loop does;
+    frames are parsed-PPM tuples (None = window missing / failed sample).
+    Returns the kept tick times."""
     state, prev, kept, times = dict(mr.SCREEN_KEEP_START), None, None, []
     for i, f in enumerate(frames):
         t = i * interval
         if f is None:
             prev = None
             continue
-        d_prev = abs(f - prev) if prev is not None else None
-        d_kept = abs(f - kept) if kept is not None else None
+        d_prev, d_kept = mr.cell_diffs(prev, f), mr.cell_diffs(kept, f)
         prev = f
         state, keep = mr.screen_keep_step(state, d_prev, d_kept, t, params)
         if keep:
@@ -749,43 +784,103 @@ def run_keeps(frames, params=P, interval=3.0):
     return times
 
 
+class TestCellDiffs(unittest.TestCase):
+    def test_per_cell_values(self):
+        a = mr.parse_ppm(ppm(24, 24, 0))
+        b = mr.parse_ppm(ppm(24, 24, 0, patch=[(0, 0, 255)]))      # cell 0 only
+        d = mr.cell_diffs(a, b)
+        self.assertEqual(len(d), 144)
+        self.assertAlmostEqual(d[0], 1 / 4)                        # 1 of 2x2 px
+        self.assertEqual(sum(d[1:]), 0)
+        self.assertIsNone(mr.cell_diffs(a, mr.parse_ppm(ppm(24, 25))))
+        self.assertIsNone(mr.cell_diffs(None, a))
+
+    def test_tiny_image_uses_fewer_cells(self):
+        d = mr.cell_diffs(mr.parse_ppm(ppm(4, 3)), mr.parse_ppm(ppm(4, 3, 255)))
+        self.assertEqual(d, [1.0] * 12)
+
+
 class TestKeepRule(unittest.TestCase):
-    def test_static_slide_kept_once_after_settling(self):
-        self.assertEqual(run_keeps([0.5] * 20), [6.0])   # ticks 0,1,2 -> keep at 2
+    """Volatile-mask keep rule on synthetic windows (default parameters)."""
 
-    def test_live_video_keeps_nothing(self):
-        video = [0.3 + 0.01 * ((i * 7) % 5) for i in range(100)]
-        self.assertEqual(run_keeps(video), [])
+    def test_static_slides_with_live_strip_kept_once_each(self):
+        s = Screen()
+        frames = [s.frame(k) for k in (0, 1, 2, 3) for _ in range(10)]
+        # strip becomes volatile on tick 3, settled 2 ticks -> keep at tick 4;
+        # later slides settle 2 ticks after they appear
+        self.assertEqual(run_keeps(frames), [12.0, 36.0, 66.0, 96.0])
 
-    def test_slide_change_kept_after_settle(self):
-        frames = [0.1] * 8 + [0.4] * 8 + [0.7] * 8
-        self.assertEqual(run_keeps(frames), [6.0, 30.0, 54.0])
+    def test_text_change_while_strip_moves_is_new(self):
+        s = Screen()
+        line = (10, 20, 100, 25)                           # one new text line
+        frames = [s.frame(0) for _ in range(10)] + \
+                 [s.frame(0, lines=[line]) for _ in range(10)]
+        self.assertEqual(run_keeps(frames), [12.0, 36.0])
 
-    def test_tiny_change_is_not_new(self):
-        frames = [0.1] * 8 + [0.103] * 8   # settles, but < change_threshold
-        self.assertEqual(run_keeps(frames), [6.0])
+    def test_caret_sized_change_is_not_new(self):
+        s = Screen()
+        frames = [s.frame(0) for _ in range(10)] + \
+                 [s.frame(0, lines=[(10, 20, 13, 25)]) for _ in range(10)]
+        self.assertEqual(run_keeps(frames), [12.0])
+
+    def test_full_window_video_keeps_nothing(self):
+        s = Screen()
+        self.assertEqual(run_keeps([s.frame(0, video=True) for _ in range(40)]), [])
+
+    def test_mostly_video_keeps_nothing(self):
+        s = Screen()       # everything but the top 10 % is live video (> 85 %)
+        frames = [s.frame(0, top_rows=TH // 10) for _ in range(40)]
+        self.assertEqual(run_keeps(frames), [])
+
+    def test_cell_that_stops_being_volatile_is_eligible_again(self):
+        s = Screen()
+        moving = [s.frame(0) for _ in range(10)]              # keep at 12 s
+        frozen = [s.frame(0, strip="static") for _ in range(8)]
+        # a change that lives only in the (former) strip region
+        changed = [s.frame(0, strip="static", lines=[(0, 62, 120, 70)])
+                   for _ in range(8)]
+        times = run_keeps(moving + frozen + changed)
+        self.assertEqual(times[0], 12.0)
+        # the frozen strip itself differs from the kept frame once it calms
+        # down (a camera turned off is a real layout change) ...
+        self.assertEqual(len([t for t in times if 30 <= t < 54]), 1)
+        # ... and a later change inside the region is seen again
+        self.assertEqual(len([t for t in times if t >= 54]), 1)
+
+    def test_while_volatile_the_strip_is_ignored(self):
+        s = Screen()
+        frames = [s.frame(0) for _ in range(30)]
+        self.assertEqual(run_keeps(frames), [12.0])
 
     def test_min_gap_delays_keep(self):
-        # second slide settles 3 s after the first keep; waits for the gap
-        frames = [0.1] * 3 + [0.5] * 10
+        s = Screen()
+        frames = [s.frame(0, strip="static")] * 2 + [s.frame(1, strip="static")] * 10
         p = dict(P, settle_ticks=1, min_gap_seconds=10)
         self.assertEqual(run_keeps(frames, p), [3.0, 15.0])
 
     def test_max_frames(self):
-        frames = []
-        for k in range(10):
-            frames += [k / 10] * 5
+        frames = [mr.parse_ppm(ppm(24, 24, k * 20)) for k in range(10) for _ in range(5)]
         self.assertEqual(len(run_keeps(frames, dict(P, max_frames=3))), 3)
         self.assertEqual(len(run_keeps(frames)), 10)
 
     def test_missing_window_resets_settling(self):
-        frames = [0.1, 0.1, None, 0.1, 0.1, 0.1]
-        self.assertEqual(run_keeps(frames), [15.0])
+        f = mr.parse_ppm(ppm(24, 24, 9))
+        self.assertEqual(run_keeps([f, f, None, f, f, f]), [15.0])
 
     def test_pure(self):
         s = dict(mr.SCREEN_KEEP_START)
-        mr.screen_keep_step(s, 0.0, None, 0, P)
+        mr.screen_keep_step(s, [0.0] * 144, None, 0, P)
         self.assertEqual(s, mr.SCREEN_KEEP_START)
+
+    def test_loop_cost_is_small(self):
+        # real thumbnails are ~250x140; two cell_diffs per tick every 3 s
+        a = (250, 140, 255, random.Random(1).randbytes(250 * 140 * 3))
+        b = (250, 140, 255, random.Random(2).randbytes(250 * 140 * 3))
+        t0 = time.process_time()
+        for _ in range(10):
+            mr.cell_diffs(a, b)
+        per_tick = (time.process_time() - t0) / 10 * 2
+        self.assertLess(per_tick / 3.0, 0.05)       # < 5 % of a core
 
 
 class TestScreenHelpers(unittest.TestCase):

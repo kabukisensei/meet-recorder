@@ -32,14 +32,29 @@ others = Others
 enabled = true
 window_class = teams-for-linux
 interval_seconds = 3
-# Fractions 0-1 of mean absolute pixel difference on a small thumbnail.
-# A frame is kept when it differs from the last kept one by > change_threshold
-# and differed from the previous tick by < stable_threshold for settle_ticks ticks.
+# The thumbnail is split into a 12x12 grid; values are fractions 0-1 of the
+# mean absolute pixel difference within a cell. A cell that keeps moving
+# (camera tiles, speaking rings) is "volatile" and ignored: volatile after
+# moving in volatile_ticks of the last volatile_window ticks, calm again after
+# volatile_window still ticks. A frame is kept when no calm cell moved by
+# more than stable_threshold for settle_ticks ticks AND (change_fraction of
+# the calm cells differ from the last kept frame by > cell_change_threshold,
+# or their mean difference is >= change_threshold). Nothing is kept while
+# more than max_volatile of the window is volatile (full-screen video).
+stable_threshold = 0.02
+cell_change_threshold = 0.02
+change_fraction = 0.03
 change_threshold = 0.005
-stable_threshold = 0.002
+volatile_ticks = 3
+volatile_window = 5
+max_volatile = 0.85
 settle_ticks = 2
 min_gap_seconds = 10
 max_frames = 300
+# Disk guards: stop keeping frames past max_mb, or when the disk would have
+# less than min_free_mb left (the audio shares that disk).
+max_mb = 300
+min_free_mb = 1024
 jpeg_quality = 80
 
 [summary]

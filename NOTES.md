@@ -122,24 +122,37 @@ with faster-whisper. Zero network/cloud use at runtime.
   longer names its raw dir (2 ticks in a row), so it cannot orphan.
 - Each tick (`interval_seconds`, 3): `hyprctl clients -j` → pick the window
   (`pick_screen_window`: class substring, mapped, meeting-like title, else
-  largest) → `grim -T id -s <scale> -t ppm -` thumbnail ~160 logical px wide
-  (~200 px on this 1.25x display), parsed in plain Python (`parse_ppm`) and
-  compared by mean absolute byte difference (`thumb_diff`, 0–1).
-- Keep rule (`screen_keep_step`, pure): keep when the diff to the last kept
-  frame > `change_threshold` AND the diff to the previous tick was <
-  `stable_threshold` for `settle_ticks` ticks in a row; plus `min_gap_seconds`
-  and `max_frames`. Kept: full-res `grim -T id -t jpeg -q 80` →
-  `<raw>/screens/00123.4s.jpg` (offset from start, sortable) + a line in
-  `<raw>/screens.jsonl`. Errors go to `<raw>/screens.log` (deduplicated),
-  never crash the loop. The loop runs at nice 10.
-- Thresholds (measured 2026-11-23 on this machine): an unchanged window gives
-  a diff of exactly 0.0 (the compositor output is deterministic), so
-  `stable_threshold = 0.002` only has to absorb small animations (speaking
-  rings, a cursor) — live camera video is far above it and never settles.
-  Text-only slide changes in a small tiled terminal measured 0.003–0.007;
-  real slides / doc pages differ far more. `change_threshold = 0.005` (2.5x
-  the stable band so a settled frame cannot flap) catches those while
-  ignoring a blinking caret or a reaction pop-up.
+  largest) → `grim -T id -s <scale> -t ppm -` thumbnail 200 logical px wide
+  (~250x140 px on this 1.25x display), parsed in plain Python (`parse_ppm`)
+  and compared per cell of a 12x12 grid (`cell_diffs`: mean absolute byte
+  difference per cell, 0–1; ~3 ms per diff).
+- **Volatile mask** (why: a real Teams share has a strip of live camera
+  tiles beside/under the slide; one global diff never settled → zero frames).
+  Keep rule (`screen_keep_step`, pure, state = last `volatile_window` "moved"
+  bitmaps + mask): a cell *moved* if its diff to the previous tick >
+  `stable_threshold` (0.02). A cell is *volatile* once it moved in ≥
+  `volatile_ticks` (3) of the last `volatile_window` (5) ticks and stays so
+  until it has not moved for 5 ticks (hysteresis, so low-motion video does
+  not flicker in and out). Volatile cells are ignored: *settled* = no calm
+  cell moved for `settle_ticks` (2) ticks; *new* = ≥ `change_fraction` (3 %)
+  of calm cells differ from the last KEPT thumbnail by >
+  `cell_change_threshold` (0.02), or their mean diff ≥ `change_threshold`
+  (0.005). > `max_volatile` (85 %) volatile (full-window video, gallery) →
+  nothing kept. Then `min_gap_seconds` / `max_frames`. A failed sample, a
+  missing window or a different stableId resets the history (no stale diff).
+  Consequences: a slide with a live strip is kept ~2 ticks after the strip
+  turns volatile (first slide ~12 s in) or after the slide changes (~6 s);
+  a camera-only call with static Teams chrome (< 85 % video) keeps one frame
+  at the start; a camera that stops moving makes its cells eligible again
+  after 5 ticks (one extra frame if that changed the picture).
+- Thresholds: an unchanged window diffs to exactly 0.0 (deterministic
+  compositor), so any per-cell value only has to beat animation. A changed
+  text line moves its cells by ~0.1–0.5 (18 of 108 calm cells in the test
+  slide); a caret-sized change touches one cell (<1 %) and is ignored.
+- Kept: full-res `grim -T id -t jpeg -q 80` → `<raw>/screens/00123.4s.jpg`
+  (offset from start, sortable) + a line in `<raw>/screens.jsonl`. Errors
+  go to `<raw>/screens.log` (deduplicated), never crash the loop. The loop
+  runs at nice 10.
 - Cost: one grab ≈ 20–30 ms of grim; the loop averages well under 1 % of a
   core (see the commit's live proof).
 - `finalize_audio` moves frames to `<folder>/screens/`, writes `screens.json`
