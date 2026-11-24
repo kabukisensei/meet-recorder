@@ -532,10 +532,9 @@ class TestPickMicTrack(unittest.TestCase):
         choice, offset, _ = mr.pick_mic_track(aec, raw, delay=1.1)
         self.assertEqual(choice, "aec")
         self.assertAlmostEqual(offset, 1.2)       # measured, within tolerance
-        # quiet AEC while the far side talks (echo removed) is fine: those
-        # seconds are not the user's own voice
+        # far side talking, user too: AEC keeping >= 1/4 of raw is fine
         sys_ = self.prof(600, [3000] * 500 + [0] * 100)
-        aec = self.prof(600, [12] * 500 + [900] * 100)
+        aec = self.prof(600, [300] * 500 + [900] * 100)
         self.assertEqual(mr.pick_mic_track(aec, raw, sys=sys_)[0], "aec")
         # an AEC track that never carried any voice proves nothing -> raw
         self.assertEqual(mr.pick_mic_track(self.prof(600, level=12), raw,
@@ -597,15 +596,33 @@ class TestPickMicTrack(unittest.TestCase):
         aec[0:30] = [80] * 30
         self.assertEqual(mr.pick_mic_track(self.prof(100, aec), raw)[0], "raw")
 
-    def test_echo_only_windows_are_not_evidence(self):
-        # raw at speech level only while the far side talks (echo): AEC is
-        # right to remove it
+    def test_overlap_windows_count(self):
+        # Fix round 10 (Codex): 5 consecutive windows where the user talks
+        # over the far side and AEC dropped it; one earlier clean window
+        # used to keep AEC. Now every raw-speech window is checked.
+        raw = self.prof(60, [300] * 10 + [1000] * 50)
+        aec = self.prof(60, [300] * 10 + [0] * 50)
+        sys_ = self.prof(60, [0] * 10 + [500] * 50)
+        choice, _, why = mr.pick_mic_track(aec, raw, sys=sys_)
+        self.assertEqual(choice, "raw")
+        self.assertIn("5 of 6", why)
+        # overlap: under 1/4 of raw is lost, at/above it is kept
+        self.assertEqual(mr.pick_mic_track(
+            self.prof(60, [300] * 10 + [240] * 50), raw, sys=sys_)[0], "raw")
+        self.assertEqual(mr.pick_mic_track(
+            self.prof(60, [300] * 10 + [260] * 50), raw, sys=sys_)[0], "aec")
+        # loud echo only (user silent) that AEC removed cannot be told
+        # apart from erased double-talk by level: when in doubt, raw
         raw = self.prof(100)
-        sys_ = self.prof(100, level=3000)
         aec = self.prof(100, [900] * 10 + [10] * 90)
-        self.assertEqual(mr.pick_mic_track(aec, raw, sys=sys_)[0], "aec")
-        # without the speaker track the same windows count -> raw
+        self.assertEqual(mr.pick_mic_track(
+            aec, raw, sys=self.prof(100, level=3000))[0], "raw")
         self.assertEqual(mr.pick_mic_track(aec, raw)[0], "raw")
+        # a window whose far-quiet seconds are clean is still lost if its
+        # overlap seconds were erased
+        sys_ = self.prof(100, ([0] * 5 + [3000] * 5) * 10)
+        aec = self.prof(100, ([900] * 5 + [0] * 5) * 10)
+        self.assertEqual(mr.pick_mic_track(aec, raw, sys=sys_)[0], "raw")
 
     def test_voice_check_aligned_by_offset(self):
         # AEC started 3 s late: AEC second i - 3 is raw second i; the first
@@ -782,8 +799,9 @@ class TestWavStatsAndChoice(unittest.TestCase):
         self.assertEqual(meta["tracks"], ["sys.wav", "mic.wav"])
         self.assertIn("encode failed", meta["mic_track_reason"])
         # the raw fallback is verified the same way (all three outputs)
-        self.assertEqual(calls, ["meeting.m4a", "meeting.m4a", "me.m4a",
-                                 "others.m4a"])
+        self.assertEqual(calls, ["meeting.m4a", "meeting.m4a",
+                                 ".me.m4a.partial.m4a",
+                                 ".others.m4a.partial.m4a"])
         self.assertTrue(os.path.exists(os.path.join(folder, "me.m4a")))
         self.assertNotIn("audio_unverified", meta)
 
@@ -795,6 +813,63 @@ class TestWavStatsAndChoice(unittest.TestCase):
         self.assertEqual(meta["wavs_kept_in"], sess)
         self.assertEqual(sorted(os.listdir(sess)),
                          ["aec.conf", "aec.log", "mic.wav", "sys.wav"])
+
+    @unittest.skipUnless(__import__("shutil").which("ffprobe"), "no ffmpeg")
+    def test_failed_stem_still_transcribes_the_mix(self):
+        # Fix round 10 (Codex): a stem that fails to encode is never
+        # published, and transcription falls back to the verified mix.
+        real = mr.encoded_ok
+
+        def stem_fails(path, secs):
+            if os.path.basename(path).startswith(".others.m4a"):
+                Path(path).write_bytes(b"partial")    # a torn encode
+                return False
+            return real(path, secs)
+        with mock.patch.object(mr, "encoded_ok", stem_fails):
+            folder, meta, sess = self.finalize(None)
+        self.assertEqual(meta["audio_unverified"], "others.m4a did not verify")
+        self.assertEqual(sorted(os.listdir(folder)),
+                         ["me.m4a", "meeting.m4a", "meta.json"])
+        self.assertEqual(mr.transcribe_inputs(folder, meta),
+                         ([os.path.join(folder, "meeting.m4a")], False))
+
+        seen = []
+
+        def fake_transcribe(paths, cfg):
+            seen.append([os.path.basename(p) for p in paths])
+            seg = (0.0, 1.5, "hello there")
+            return [([seg], 2.0) for _ in paths]
+        state = os.path.join(self.d, "state")
+        cfg_file = os.path.join(self.d, "config.ini")
+        Path(cfg_file).write_text("[summary]\nsummary_cmd =\n")
+        with mock.patch.object(mr, "transcribe", fake_transcribe), \
+                mock.patch.object(mr, "notify", lambda *a: None), \
+                mock.patch.object(mr, "JOBS_DIR", state), \
+                mock.patch.object(mr, "LAST_FILE",
+                                  os.path.join(state, "last.json")), \
+                mock.patch.object(mr, "CONFIG_FILE", cfg_file), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mr.cmd_transcribe([folder]), 0)
+        self.assertEqual(seen, [["meeting.m4a"]])
+        self.assertIn("hello there",
+                      Path(folder, "transcript.md").read_text())
+        meta = mr.read_json(os.path.join(folder, "meta.json"))
+        self.assertEqual(meta["transcript_status"], "done")
+        self.assertIs(meta["speaker_labels"], False)
+
+    def test_transcribe_inputs(self):
+        folder = self.d
+        mix = [os.path.join(folder, "meeting.m4a")]
+        self.assertEqual(mr.transcribe_inputs(folder, {}), (mix, False))
+        Path(folder, "me.m4a").write_bytes(b"x")
+        self.assertEqual(mr.transcribe_inputs(folder, {}), (mix, False))
+        Path(folder, "others.m4a").write_bytes(b"x")
+        stems = [os.path.join(folder, n) for n in ("me.m4a", "others.m4a")]
+        self.assertEqual(mr.transcribe_inputs(folder, {}), (stems, True))
+        # an older recorder could leave a partial stem behind
+        self.assertEqual(mr.transcribe_inputs(
+            folder, {"audio_unverified": "others.m4a did not verify"}),
+            (mix, False))
 
     def test_wavs_kept_when_encoding_fails(self):
         def boom(cmd, **kw):

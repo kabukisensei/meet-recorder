@@ -591,6 +591,7 @@ SYS_QUIET_RMS = 100       # 1 s RMS on sys.wav below this: far side quiet
 AEC_SILENT_RMS = 30       # AEC RMS below this is near-silent ...
 AEC_SILENT_RATIO = 0.1    # ... and so is anything 20 dB under the raw mic
 AEC_LOST_FRACTION = 0.2   # > this share of raw speech windows lost -> raw
+AEC_OVERLAP_RATIO = 0.25  # far side audible: AEC under 1/4 of raw = lost
 
 
 def _rms(values):
@@ -605,12 +606,16 @@ def aec_voice_error(aec_rms, raw_rms, sys_rms=None, offset=0):
     seconds before it are spliced from the raw track anyway).
     - Wholly near-silent AEC while the raw mic has speech-level signal
       anywhere -> raw.
-    - Per VOICE_WINDOW-second window: the seconds where the raw mic is at
-      speech level and the far side (sys.wav) is quiet are the user's own
-      voice (with the far side talking, raw may just be echo that AEC is
-      right to remove). The window is "lost" if AEC over those seconds is
-      near-silent (< AEC_SILENT_RMS or 20 dB under raw). More than
-      AEC_LOST_FRACTION of such windows lost -> raw.
+    - Every VOICE_WINDOW-second window with raw speech-level seconds is
+      checked (fix round 10, Codex: skipping overlap let AEC erase the
+      user talking over the far side). Seconds with the far side quiet
+      (sys.wav < SYS_QUIET_RMS, or unknown) are lost if AEC is
+      near-silent (< AEC_SILENT_RMS or 20 dB under raw); seconds with the
+      far side audible are lost if AEC is under AEC_OVERLAP_RATIO of raw.
+      A window is lost if either group is. More than AEC_LOST_FRACTION of
+      the windows lost -> raw. RMS alone cannot tell double-talk from
+      plain echo, so a window of loud echo that AEC rightly removed also
+      counts as lost: when in doubt, the raw mic.
     """
     speech = [i for i, r in enumerate(raw_rms)
               if i >= offset and r >= RAW_SPEECH_RMS]
@@ -620,17 +625,27 @@ def aec_voice_error(aec_rms, raw_rms, sys_rms=None, offset=0):
               if 0 <= i - offset < len(aec_rms) else 0.0)
     if max(aec_rms or [0.0]) < AEC_SILENT_RMS:
         return "echo-cancelled track silent while the mic was not"
+
+    def far_quiet(i):
+        return sys_rms is None or i >= len(sys_rms) or sys_rms[i] < SYS_QUIET_RMS
+
+    def group_lost(seconds, floor, ratio):
+        if not seconds:
+            return False
+        raw_level = _rms([raw_rms[i] for i in seconds])
+        aec_level = _rms([aec_at(i) for i in seconds])
+        return aec_level < max(floor, raw_level * ratio)
+
     windows = lost = 0
     for w in range(0, len(raw_rms), VOICE_WINDOW):
-        own = [i for i in speech if w <= i < w + VOICE_WINDOW
-               and (sys_rms is None or i >= len(sys_rms)
-                    or sys_rms[i] < SYS_QUIET_RMS)]
-        if not own:
+        here = [i for i in speech if w <= i < w + VOICE_WINDOW]
+        if not here:
             continue
         windows += 1
-        raw_level = _rms([raw_rms[i] for i in own])
-        aec_level = _rms([aec_at(i) for i in own])
-        if aec_level < max(AEC_SILENT_RMS, raw_level * AEC_SILENT_RATIO):
+        own = [i for i in here if far_quiet(i)]
+        overlap = [i for i in here if not far_quiet(i)]
+        if (group_lost(own, AEC_SILENT_RMS, AEC_SILENT_RATIO)
+                or group_lost(overlap, 0.0, AEC_OVERLAP_RATIO)):
             lost += 1
     if windows and lost > AEC_LOST_FRACTION * windows:
         return (f"echo-cancelled track lost your voice in {lost} of "
@@ -2097,6 +2112,9 @@ def encoded_ok(path, expect_seconds):
     return got is not None and got >= expect_seconds * 0.95 - 1.0
 
 
+STEMS = ("me.m4a", "others.m4a")     # mic, speaker; per-track transcription
+
+
 class Unverified(RuntimeError):
     """An encoded output is missing or shorter than its input WAV."""
 
@@ -2111,6 +2129,9 @@ def encode_session(folder, sys_wav, mic_wav, cfg):
     if not have:
         raise RuntimeError("no audio was captured")
     final_m4a = os.path.join(folder, "meeting.m4a")
+    for name in STEMS:      # a stem from an earlier attempt is stale
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.path.join(folder, name))
     if len(have) == 2:
         cmd = build_ffmpeg_mix_cmd(
             sys_wav, mic_wav, final_m4a,
@@ -2126,15 +2147,34 @@ def encode_session(folder, sys_wav, mic_wav, cfg):
     secs = {w: (wav_stats(w) or {}).get("seconds", 0.0) for w in have}
     if not encoded_ok(final_m4a, max(secs.values())):
         raise Unverified("meeting.m4a did not verify")
-    # Keep each side as its own small file so the transcript can say who spoke.
-    for wav, name in ((mic_wav, "me.m4a"), (sys_wav, "others.m4a")):
+    # Keep each side as its own small file so the transcript can say who
+    # spoke. Encoded under a temp name and published (renamed) only once
+    # verified, so a stem that exists is a verified one (fix round 10).
+    for wav, name in zip((mic_wav, sys_wav), STEMS):
         if wav in have:
             out = os.path.join(folder, name)
+            tmp = os.path.join(folder, f".{name}.partial.m4a")
             subprocess.run(["ffmpeg", "-y", "-i", wav, "-c:a", "aac", "-b:a",
-                            "48k", out], check=False, **quiet)
-            if not encoded_ok(out, secs[wav]):
+                            "48k", tmp], check=False, **quiet)
+            if not encoded_ok(tmp, secs[wav]):
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(tmp)
                 raise Unverified(f"{name} did not verify")
+            os.replace(tmp, out)
     return have
+
+
+def transcribe_inputs(folder, meta):
+    """(audio files, speaker_labels) for transcription: the per-track stems
+    only when BOTH exist (each is published only after it verified) and
+    meta.json reports no unverified audio (an older recorder could leave a
+    partial stem); otherwise the mixed meeting.m4a, unlabelled, exactly as
+    for recordings that predate the stems."""
+    stems = [os.path.join(folder, name) for name in STEMS]
+    if (all(os.path.isfile(p) for p in stems)
+            and isinstance(meta, dict) and not meta.get("audio_unverified")):
+        return stems, True
+    return [os.path.join(folder, "meeting.m4a")], False
 
 
 def finalize_audio(state, cfg):
@@ -2638,14 +2678,14 @@ def cmd_transcribe(args=()):
     status = "failed"
     updates = {}         # merged into meta.json at the end (update_meta)
     try:
-        me_audio = os.path.join(folder, "me.m4a")
-        others_audio = os.path.join(folder, "others.m4a")
-        if os.path.exists(me_audio) and os.path.exists(others_audio):
-            (me, d1), (others, d2) = transcribe([me_audio, others_audio], cfg)
+        inputs, labelled = transcribe_inputs(folder, meta)
+        if labelled:
+            (me, d1), (others, d2) = transcribe(inputs, cfg)
             segments, duration = merge_speakers(me, others), max(d1, d2)
             updates["speaker_labels"] = True
         else:
-            [(segments, duration)] = transcribe([audio], cfg)
+            [(segments, duration)] = transcribe(inputs, cfg)
+            updates["speaker_labels"] = False   # a re-run may drop the stems
         start = os.path.getmtime(audio) - duration
         try:
             start = time.mktime(time.strptime(meta["started"][:19],

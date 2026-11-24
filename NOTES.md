@@ -230,17 +230,25 @@ pinned MIC is fine: the canceller captures that same mic by name.
   0.5 s of `aec_delay` both ways, delay <= `AEC_MAX_DELAY` (5 s); (d)
   `aec_voice_error` finds no lost voice: AEC wholly near-silent (RMS < 30)
   while raw has speech (1 s RMS >= 250) anywhere -> raw; otherwise per
-  10 s window, the seconds where raw is at speech level AND sys.wav is
-  quiet (RMS < 100: those are the user's own voice; with the far side
-  talking, raw may be echo that AEC rightly removes) -- AEC over them
-  near-silent (< 30 or 20 dB under raw) = lost; > 20 % of such windows
-  lost -> raw. The chosen AEC track is spliced behind the first offset
+  10 s window with raw speech-level seconds (fix round 10, Codex: overlap
+  used to be skipped, so AEC could erase the user talking over the far
+  side): seconds with sys.wav quiet (RMS < 100) are lost if AEC is
+  near-silent (< 30 or 20 dB under raw); seconds with the far side
+  audible are lost if AEC < `AEC_OVERLAP_RATIO` (0.25) x raw; a window
+  is lost if either group is; > 20 % of windows lost -> raw. RMS cannot
+  tell double-talk from loud echo, so loud echo that AEC rightly removed
+  also rejects AEC -- deliberate: when in doubt, raw. The chosen AEC track is spliced behind the first offset
   seconds of raw (`splice_mic` -> `mic-aec-aligned.wav`) so it lines up
   with sys.wav. Fix-round-7 sessions (AEC in `mic_wav`, raw in
   `mic_raw_wav`) use their raw track.
 - Verification (`encode_session`): meeting.m4a, me.m4a and others.m4a
   must all decode at >= 95 % - 1 s of their input, on the AEC path AND
-  the raw path. AEC failing -> re-encode from raw. Raw failing ->
+  the raw path. Stems are encoded to `.<name>.partial.m4a` and renamed
+  into place only once verified (old stems are removed first), so an
+  existing stem is a verified one (fix round 10). `transcribe_inputs`:
+  per-track transcription only when BOTH stems exist and meta.json has
+  no `audio_unverified`; otherwise meeting.m4a, unlabelled (like old
+  recordings; `speaker_labels: false`). AEC failing -> re-encode from raw. Raw failing ->
   `Unverified`: every WAV is kept in the staging dir, meta.json gets
   `audio_unverified` + `wavs_kept_in`, transcription still runs (the
   collector keeps a dir with WAVs).
@@ -522,6 +530,16 @@ against a real mic. Until then `mic_source = raw`.
 - `SUPER+ALT+R` = `meet-recorder snap` (Task 9, below). Verified free on
   2026-11-24 with `hyprctl binds -j` (modmask 72 + R unused; SUPER+CTRL(+ALT/
   SHIFT)+R are the reminder binds).
+
+## Known limitations
+
+- The speaker capture follows the system default sink. If Teams alone is
+  switched to a different output device while the system default stays
+  put, the remote side is not captured. Switch the system output (e.g. via
+  the bar / AirPods panel) rather than inside Teams.
+- The snap hotkey collision check (`install-hypr-bind.sh`) covers keysym
+  binds only, not `code:NN` keycode binds (verified 2026-11-24: no keycode
+  binds exist on this box).
 
 ## Manual snap (Task 9, 2026-11-24)
 
