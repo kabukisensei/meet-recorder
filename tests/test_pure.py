@@ -13,10 +13,12 @@ import io
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLI_PATH = os.path.join(HERE, "..", "meet-recorder")
@@ -315,6 +317,27 @@ class TestSegmentsToVtt(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 mr.segments_to_vtt(bad)
 
+    def test_absurd_numbers_are_value_errors(self):
+        for v in (1e308, -1e308, 10 ** 400, 1e7 + 1):
+            with self.assertRaises(ValueError, msg=repr(v)):
+                mr.segments_to_vtt([{"start": 0, "end": v, "text": "x"}])
+        # the largest accepted value still renders
+        self.assertIn("2777:46:40.000", mr.segments_to_vtt([seg(0, 1e7, "x")]))
+
+    def test_voice_names_escaped_once(self):
+        vtt = mr.segments_to_vtt([seg(0, 1, "a", "Me"), seg(1, 2, "b", "Others")],
+                                 me="R&D <Ops>", others="A & B")
+        self.assertIn("<v R&amp;D &lt;Ops&gt;>a</v>", vtt)
+        self.assertIn("<v A &amp; B>b</v>", vtt)
+        self.assertEqual([html.unescape(v) for _, _, v, _ in parse_vtt(vtt)],
+                         ["R&D <Ops>", "A & B"])
+
+    def test_same_ms_starts_keep_spoken_order(self):
+        # 1.0001 and 1.0004 both round to 1.000; the later one ends sooner
+        vtt = mr.segments_to_vtt([seg(1.0004, 1.2, "second"),
+                                  seg(1.0001, 5.0, "first")])
+        self.assertLess(vtt.index("first"), vtt.index("second"))
+
     def test_speaker_name_mapping(self):
         vtt = mr.segments_to_vtt([seg(0, 1, "a", "Me"), seg(1, 2, "b", "Others"),
                                   seg(2, 3, "c", "")],
@@ -395,6 +418,23 @@ class TestParseMdTranscript(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(text)):
                 mr.parse_md_transcript(text)
 
+    def test_no_speech_marker_only_as_recorder_body(self):
+        for text in ("_No speech detected._\n",
+                     "# Meeting x\n\n_No speech detected._\n",
+                     "Duration: 00:03\n\n_No speech detected._"):
+            self.assertEqual(mr.parse_md_transcript(text), [], msg=repr(text))
+        for text in ("# Notes\n\nsome unrelated text\n\n_No speech detected._\n",
+                     "_No speech detected._\nand then more\n",
+                     "# A\n# B\n_No speech detected._\n",
+                     "Lorem\n_No speech detected._\nipsum\n"):
+            with self.assertRaises(ValueError, msg=repr(text)):
+                mr.parse_md_transcript(text)
+
+    def test_bad_seconds_row_is_an_error_not_text(self):
+        md = "# M\n\n[00:01 -> 00:02] Me: fine\n[00:03 -> 00:75] Others: bad\n"
+        with self.assertRaisesRegex(ValueError, "line 4"):
+            mr.parse_md_transcript(md)
+
 
 def make_cfg(d, body="[speakers]\nme = Ser Nine\nothers = Tanner\n"):
     """A config file under d, independent of the user's own config.ini."""
@@ -442,6 +482,86 @@ class TestWriteTranscripts(unittest.TestCase):
                              "[00:00 -> 00:01] Me: hi\n")
             self.assertTrue(Path(d, "transcript.md").read_text().endswith(
                 "[00:00 -> 00:01] Me: hi\n"))
+            self.assertEqual([p for p in os.listdir(d) if p.endswith(".tmp")], [])
+
+    def test_failed_segments_refresh_never_resurrects_old_transcript(self):
+        cfg = mr.load_config("/nonexistent/path.ini")
+        real = mr.write_json
+
+        def failing(path, data, private=False):
+            if path.endswith("segments.json"):
+                raise OSError(28, "No space left on device")
+            return real(path, data, private)
+
+        with tempfile.TemporaryDirectory() as d, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(mr.write_transcripts(
+                d, [(0, 1, "old", "Me")], 1_700_000_000, 1, "", cfg))
+            with mock.patch.object(mr, "write_json", failing):
+                err = mr.write_transcripts(d, [(0, 1, "new", "Me")],
+                                           1_700_000_000, 1, "", cfg)
+            self.assertIn("No space left", err)
+            self.assertFalse(os.path.exists(os.path.join(d, "segments.json")))
+            self.assertEqual(mr.cmd_export([d]), 0)       # the retry
+            vtt = parse_vtt(Path(d, "transcript.vtt").read_text(encoding="utf-8"))
+            self.assertEqual([c[3] for c in vtt], ["new"])
+
+    def test_cache_older_than_md_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d, \
+                contextlib.redirect_stdout(io.StringIO()):
+            Path(d, "segments.json").write_text(json.dumps([seg(0, 1, "old", "Me")]))
+            Path(d, "transcript.md").write_text("# M\n\n[00:00 -> 00:01] Me: new\n")
+            os.utime(os.path.join(d, "segments.json"), (1_000_000, 1_000_000))
+            self.assertEqual(mr.cmd_export([d]), 0)
+            self.assertEqual(json.loads(Path(d, "segments.json").read_text())[0]["text"],
+                             "new")
+            self.assertEqual(mr.load_folder_segments(d)[0]["text"], "new")
+
+
+class TestAtomicWritePermissions(unittest.TestCase):
+    def mode(self, path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_new_file_honours_umask(self):
+        with tempfile.TemporaryDirectory() as d:
+            old = os.umask(0o077)
+            try:
+                mr.write_text_atomic(os.path.join(d, "a.vtt"), "x")
+                mr.write_json(os.path.join(d, "b.json"), [])
+            finally:
+                os.umask(old)
+            self.assertEqual(self.mode(os.path.join(d, "a.vtt")), 0o600)
+            self.assertEqual(self.mode(os.path.join(d, "b.json")), 0o600)
+            old = os.umask(0o022)
+            try:
+                mr.write_text_atomic(os.path.join(d, "c.vtt"), "x")
+            finally:
+                os.umask(old)
+            self.assertEqual(self.mode(os.path.join(d, "c.vtt")), 0o644)
+
+    def test_replacing_keeps_existing_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "transcript.vtt")
+            Path(path).write_text("old")
+            os.chmod(path, 0o600)
+            old = os.umask(0o022)
+            try:
+                mr.write_text_atomic(path, "new")
+            finally:
+                os.umask(old)
+            self.assertEqual((self.mode(path), Path(path).read_text()), (0o600, "new"))
+
+    def test_private_is_0600_even_with_open_umask(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "screens.json")
+            Path(path).write_text("[]")
+            os.chmod(path, 0o644)
+            old = os.umask(0)
+            try:
+                mr.write_json(path, [], private=True)
+            finally:
+                os.umask(old)
+            self.assertEqual(self.mode(path), 0o600)
             self.assertEqual([p for p in os.listdir(d) if p.endswith(".tmp")], [])
 
 
@@ -499,6 +619,25 @@ class TestExport(unittest.TestCase):
         self.assertEqual(self.vtt(good), [(1.5, 2.25, "Ser Nine", "fine")])
         self.assertFalse(os.path.exists(os.path.join(notes, "segments.json")))
         self.assertFalse(os.path.exists(os.path.join(bad, "transcript.vtt")))
+
+    def test_absurd_numbers_fail_one_folder_not_the_batch(self):
+        huge = self.folder("huge", {"segments.json": '[{"start": 0, "end": 1e308, '
+                                    '"text": "x"}]'})
+        digits = self.folder("digits", {"segments.json": '[{"start": 0, "end": 1'
+                                        + "0" * 400 + ', "text": "x"}]'})
+        good = self.folder("ok", {"segments.json": json.dumps([seg(0, 1, "fine")])})
+        self.assertEqual(mr.cmd_export([huge, digits, good]), 1)
+        self.assertIn(huge + ": export failed", self.err.getvalue())
+        self.assertIn(digits + ": export failed", self.err.getvalue())
+        self.assertEqual(self.vtt(good)[0][3], "fine")
+
+    def test_truncated_cache_recovers_from_md(self):
+        d = self.folder("torn", {"segments.json": '[{"start": 0, "en',
+                                 "transcript.md": "# M\n\n[00:00 -> 00:02] Me: hi\n"})
+        os.utime(os.path.join(d, "transcript.md"), (1_000_000, 1_000_000))
+        self.assertEqual(mr.cmd_export([d]), 0)
+        self.assertEqual(self.vtt(d)[0][3], "hi")
+        self.assertEqual(len(json.loads(Path(d, "segments.json").read_text())), 1)
 
     def test_bad_segments_keep_existing_vtt(self):
         d = self.folder("keep", {"segments.json": "[{}]",

@@ -13,9 +13,9 @@ import os
 import re
 import signal
 import shutil
+import stat
 import subprocess
 import sys
-import tempfile
 import time
 
 STATE_DIR = os.path.expanduser("~/.local/state/meet-recorder")
@@ -115,12 +115,18 @@ def segment_dicts(segments):
     return out
 
 
+# Segment times beyond this (~115 days) are corrupt data, not a meeting; the
+# bound also keeps the ms arithmetic far away from float overflow.
+MAX_SEGMENT_SECONDS = 1e7
+
+
 def validate_segments(segments):
     """Check a segments.json-style list; return normalized copies.
 
-    Each item must be an object with finite numeric 'start' / 'end' and a
-    string 'text'; 'speaker' is optional (string). Raises ValueError naming
-    the first bad item.
+    Each item must be an object with finite numeric 'start' / 'end' within
+    +-MAX_SEGMENT_SECONDS and a string 'text'; 'speaker' is optional
+    (string). Raises ValueError naming the first bad item (absurd numbers
+    such as 1e308 or a 400-digit integer included, never OverflowError).
     """
     if not isinstance(segments, list):
         raise ValueError("segments must be a list")
@@ -131,10 +137,16 @@ def validate_segments(segments):
         times = []
         for key in ("start", "end"):
             v = d.get(key)
-            if (isinstance(v, bool) or not isinstance(v, (int, float))
-                    or not math.isfinite(v)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise ValueError(f"segment {i}: '{key}' is not a finite number")
-            times.append(float(v))
+            try:
+                v = float(v)
+            except OverflowError:
+                v = math.inf
+            if not math.isfinite(v) or abs(v) > MAX_SEGMENT_SECONDS:
+                raise ValueError(f"segment {i}: '{key}' is not a finite number "
+                                 f"of seconds within {MAX_SEGMENT_SECONDS:g}")
+            times.append(v)
         text, speaker = d.get("text"), d.get("speaker", "")
         if not isinstance(text, str):
             raise ValueError(f"segment {i}: 'text' is not a string")
@@ -164,22 +176,26 @@ def segments_to_vtt(segments, me="Me", others="Others"):
     to be strictly after start (WebVTT requires end > start), which covers
     reversed, zero-length and same-millisecond segments. A blank voice name
     falls back to 'Me' / 'Others' (WebVTT needs a non-empty annotation).
+    Cues are ordered by the original (unrounded) start, then end, so two
+    starts that round to the same millisecond keep their spoken order.
+    Names are escaped exactly once.
     """
-    me = vtt_escape(me) or "Me"
-    others = vtt_escape(others) or "Others"
+    me = " ".join(str(me).split()) or "Me"
+    others = " ".join(str(others).split()) or "Others"
     cues = []
     timed = []
     for d in validate_segments(segments):
         start_ms = vtt_ms(d["start"])
         end_ms = max(vtt_ms(d["end"]), start_ms + 1)
-        timed.append((start_ms, end_ms, d))
-    for start_ms, end_ms, d in sorted(timed, key=lambda t: (t[0], t[1])):
+        timed.append((d["start"], d["end"], start_ms, end_ms, d))
+    for _, _, start_ms, end_ms, d in sorted(timed, key=lambda t: (t[0], t[1])):
         text = vtt_escape(d["text"])
         if not text:
             continue
         label = d["speaker"]
         fallback = me if label == "Me" else others
-        name = vtt_escape(speaker_name(label, me, others)) or fallback
+        name = vtt_escape(speaker_name(label, me, others) or fallback)
+        name = name or vtt_escape(fallback)
         cues.append(f"{len(cues) + 1}\n{fmt_vtt_ms(start_ms)} --> "
                     f"{fmt_vtt_ms(end_ms)}\n<v {name}>{text}</v>\n")
     return "WEBVTT\n\n" + "\n".join(cues)
@@ -219,21 +235,40 @@ def parse_md_transcript(content, labels=None):
     Lines that follow a timestamped record (until the next one) are
     continuation lines of that utterance (whisper text can contain newlines)
     and are kept, newline-joined; header lines before the first record are
-    skipped. The recorder's explicit no-speech marker yields []; any other
-    input without a single record raises ValueError.
+    skipped. A line that looks like a record but has an impossible time
+    (seconds > 59) is invalid input, never continuation text: ValueError.
+    The recorder's own no-speech body (is_no_speech_md) yields []; any
+    other input without a single record raises ValueError.
     """
     segs, lines = [], content.splitlines()
-    for line in lines:
+    for n, line in enumerate(lines, 1):
         d = parse_md_line(line, labels)
         if d is not None:
             segs.append(d)
+        elif _MD_LINE_LOOSE.match(line):
+            raise ValueError(f"line {n}: invalid timestamp in {line.strip()!r}")
         elif segs:
             segs[-1]["text"] += "\n" + line
     for d in segs:
         d["text"] = d["text"].strip()
-    if not segs and MD_NO_SPEECH not in (l.strip() for l in lines):
+    if not segs and not is_no_speech_md(content):
         raise ValueError("no '[mm:ss -> mm:ss] text' rows found in transcript")
     return segs
+
+
+_MD_LINE_LOOSE = re.compile(r"^\[\d+:\d+ -> \d+:\d+\]")
+_MD_HEADER = re.compile(r"^(# .*|Duration: \d+:\d\d)$")
+
+
+def is_no_speech_md(content):
+    """True only for the recorder's own no-speech transcript.md: at most the
+    '# title' and 'Duration:' header lines, then the marker, nothing else."""
+    rows = [l.strip() for l in content.splitlines() if l.strip()]
+    if not rows or rows[-1] != MD_NO_SPEECH or len(rows) > 3:
+        return False
+    head = rows[:-1]
+    return (all(_MD_HEADER.match(l) for l in head)
+            and len({l[0] for l in head}) == len(head))
 
 
 def _words(text):
@@ -716,17 +751,42 @@ def read_json(path):
         return None
 
 
-def write_text_atomic(path, text):
-    """Write UTF-8 text via a unique temp file + os.replace, so a failure
-    never leaves a truncated file or clobbers the previous version."""
+def open_new_file(folder, name_prefix, mode):
+    """Create a unique, empty temp file in folder with os.open semantics
+    (mode is filtered by the umask). Returns (fd, path)."""
+    while True:
+        tmp = os.path.join(folder, f"{name_prefix}.{os.urandom(6).hex()}.tmp")
+        try:
+            return os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                           | os.O_CLOEXEC, mode), tmp
+        except FileExistsError:
+            continue
+
+
+def write_bytes_atomic(path, data, private=False):
+    """Publish bytes at path via a unique temp file + os.replace, so a
+    failure never leaves a truncated file or clobbers the previous version
+    (the temp file is removed on any error).
+
+    Permissions: private -> 0600 (stricter if the umask says so);
+    replacing an existing file -> keeps that file's mode; a new file ->
+    0666 filtered by the umask, exactly like open(path, "w").
+    """
     folder = os.path.dirname(path) or "."
     os.makedirs(folder, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=folder, suffix=".tmp",
-                               prefix="." + os.path.basename(path) + ".")
+    keep_mode = None
+    if not private:
+        try:
+            keep_mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            pass
+    fd, tmp = open_new_file(folder, "." + os.path.basename(path),
+                            0o600 if private else 0o666)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(tmp, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            if keep_mode is not None:
+                os.fchmod(f.fileno(), keep_mode)
+            f.write(data)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -736,8 +796,13 @@ def write_text_atomic(path, text):
         raise
 
 
-def write_json(path, data):
-    write_text_atomic(path, json.dumps(data, indent=1))
+def write_text_atomic(path, text, private=False):
+    """write_bytes_atomic for UTF-8 text."""
+    write_bytes_atomic(path, text.encode("utf-8"), private)
+
+
+def write_json(path, data, private=False):
+    write_text_atomic(path, json.dumps(data, indent=1), private)
 
 
 def active_jobs():
@@ -891,9 +956,19 @@ def write_transcripts(folder, segments, start_unix, duration, title="",
         f.write(f"# {title or 'Meeting'} {iso}\n\n")
         f.write(f"Duration: {fmt_ts(duration)}\n\n")
         f.write(body if body else MD_NO_SPEECH + "\n")
+    seg_path = os.path.join(folder, "segments.json")
     try:
         seg_dicts = segment_dicts(segments)
-        write_json(os.path.join(folder, "segments.json"), seg_dicts)
+        try:
+            write_json(seg_path, seg_dicts)
+        except Exception:
+            # The old segments.json now describes the previous transcript;
+            # never leave it for `export` to trust.
+            try:
+                os.remove(seg_path)
+            except OSError:
+                pass
+            raise
         write_vtt(folder, seg_dicts, cfg or load_config())
     except Exception as e:
         return f"{type(e).__name__}: {e}"
@@ -1013,20 +1088,9 @@ def spawn_screens(sess_dir):
 
 
 def load_folder_segments(folder):
-    """Segment dicts for a session folder: segments.json if usable, else
-    parsed transcript.md, else []."""
+    """Segment dicts for a session folder (folder_segments), else []."""
     try:
-        with open(os.path.join(folder, "segments.json"), encoding="utf-8") as f:
-            segs = validate_segments(json.load(f))
-        if segs:
-            return segs
-    except (OSError, ValueError):
-        pass
-    meta = read_json(os.path.join(folder, "meta.json"))
-    labels = bool(meta.get("speaker_labels")) if isinstance(meta, dict) else None
-    try:
-        with open(os.path.join(folder, "transcript.md"), encoding="utf-8") as f:
-            return parse_md_transcript(f.read(), labels)
+        return folder_segments(folder)[0]
     except (OSError, ValueError):
         return []
 
@@ -1185,7 +1249,7 @@ def cmd_export(args=()):
         folder = os.path.abspath(os.path.expanduser(arg))
         try:
             print(export_folder(folder, cfg))
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, ArithmeticError) as e:
             print(f"{folder}: export failed: {e}", file=sys.stderr)
             rc = 1
     return rc
@@ -1202,22 +1266,44 @@ def export_folder(folder, cfg):
     """
     if not os.path.isdir(folder):
         raise FileNotFoundError(f"not a folder: {folder}")
+    segs, from_md = folder_segments(folder)
+    if from_md:
+        write_json(os.path.join(folder, "segments.json"), segs)
+    return write_vtt(folder, segs, cfg)
+
+
+def folder_segments(folder):
+    """(segment dicts, from_md) for a session folder.
+
+    segments.json is trusted only when it is valid, non-empty and not older
+    than transcript.md (a failed refresh after a re-transcription must not
+    resurrect the previous transcript); otherwise transcript.md is parsed.
+    Without transcript.md, segments.json errors are raised as they are.
+    Raises OSError / ValueError.
+    """
     seg_path = os.path.join(folder, "segments.json")
     md_path = os.path.join(folder, "transcript.md")
-    segs = None
+    try:
+        md_mtime = os.stat(md_path).st_mtime_ns
+    except FileNotFoundError:
+        md_mtime = None
     if os.path.exists(seg_path):
-        with open(seg_path, encoding="utf-8") as f:
-            segs = validate_segments(json.load(f))
-    if not segs and os.path.exists(md_path):
-        meta = read_json(os.path.join(folder, "meta.json"))
-        labels = (bool(meta.get("speaker_labels"))
-                  if isinstance(meta, dict) else None)
-        with open(md_path, encoding="utf-8") as f:
-            segs = parse_md_transcript(f.read(), labels)
-        write_json(seg_path, segs)
-    if segs is None:
+        try:
+            if md_mtime is not None and os.stat(seg_path).st_mtime_ns < md_mtime:
+                raise ValueError("segments.json is older than transcript.md")
+            with open(seg_path, encoding="utf-8") as f:
+                segs = validate_segments(json.load(f))
+            if segs or md_mtime is None:
+                return segs, False
+        except (OSError, ValueError):
+            if md_mtime is None:
+                raise
+    if md_mtime is None:
         raise FileNotFoundError("no segments.json or transcript.md to export")
-    return write_vtt(folder, segs, cfg)
+    meta = read_json(os.path.join(folder, "meta.json"))
+    labels = bool(meta.get("speaker_labels")) if isinstance(meta, dict) else None
+    with open(md_path, encoding="utf-8") as f:
+        return parse_md_transcript(f.read(), labels), True
 
 
 def grab_thumb(stable_id, width, env):

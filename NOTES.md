@@ -85,17 +85,27 @@ with faster-whisper. Zero network/cloud use at runtime.
   `end = max(end, start + 1 ms)` (WebVTT rule). `segments.json` keeps the
   original float timings untouched.
 - transcript.md/.txt are written first; a VTT/segments.json failure does not
-  fail transcription — it is notified/logged; retry with `export`.
-  VTT and JSON are published atomically (temp file + `os.replace`, UTF-8).
-- `meet-recorder export <folder>...` backfills old folders: uses
-  `segments.json` if present (validated; an empty `[]` defers to the md),
-  else parses `transcript.md` (second precision; continuation lines of a
-  multi-line utterance are kept). Speaker prefixes: `meta.json`
+  fail transcription — it is notified/logged; retry with `export`. If the
+  segments.json refresh fails, the old segments.json is deleted (it would
+  describe the previous transcript).
+  VTT and JSON are published atomically (`write_bytes_atomic`: unique temp
+  file + `os.replace`, UTF-8). Modes: a new file gets 0666 & ~umask (like
+  `open()`), a replaced file keeps its mode, `private=True` forces 0600.
+- `meet-recorder export <folder>...` backfills old folders (`folder_segments`):
+  `segments.json` is used only if valid, non-empty AND not older (mtime) than
+  `transcript.md`; otherwise `transcript.md` is parsed (second precision;
+  continuation lines of a multi-line utterance are kept) and segments.json
+  rewritten. A torn/invalid segments.json with no transcript.md is an error.
+  Times beyond ±1e7 s (`MAX_SEGMENT_SECONDS`) are invalid (no OverflowError).
+  Speaker prefixes: `meta.json`
   `speaker_labels: true` → `Me: ` / `Others: ` are labels; meta.json without
   it → no labels (text kept whole); no meta.json → prefix heuristic. A
-  transcript with no `[mm:ss -> mm:ss]` rows is an error unless it is the
-  recorder's `_No speech detected._`. Bad folders are reported, the batch
+  transcript with no `[mm:ss -> mm:ss]` rows is an error unless it is exactly
+  the recorder's no-speech body (`# title`, `Duration:`, `_No speech
+  detected._`, nothing else); a row with an impossible time (`[00:75 -> …]`)
+  is an error, never continuation text. Bad folders are reported, the batch
   continues, exit 1 if any failed. Idempotent.
+- Voice names are escaped once; cues sort by the unrounded start/end.
 - Validate: `ffmpeg -y -v error -i transcript.vtt -f srt /dev/null` (without
   `-y` ffmpeg refuses to "overwrite" /dev/null and still exits 0).
 
