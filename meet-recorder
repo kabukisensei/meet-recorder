@@ -1016,8 +1016,13 @@ def stop_procs(recorders, worker=None, timeout=5.0):
     group id can be reused). A capture child cannot outlive the worker:
     it gets SIGKILL when the worker dies (CaptureRunner, PR_SET_PDEATHSIG).
     Anything still alive after timeout gets SIGKILL. Processes whose
-    identity no longer matches (exited, PID reused) are never signalled.
+    identity no longer matches (exited, PID reused) are never signalled,
+    nor a worker whose start time was never saved (unverifiable).
     """
+    if worker and worker[1] is None:
+        print(f"not signalling screens worker {worker[0]}: no saved start "
+              "time to verify it", file=sys.stderr)
+        worker = None
     live = [p for p in recorders if send_signal(p, signal.SIGINT)]
     if worker and send_signal(worker, signal.SIGTERM):
         live.append(worker)
@@ -1176,6 +1181,23 @@ def make_private_dir(path):
     os.chmod(path, 0o700)
 
 
+def new_session_dir():
+    """(id, path) of a fresh 0700 staging dir under CACHE_DIR, created
+    exclusively: an existing path is never adopted (start's rollback
+    deletes the dir, which must be one this attempt made)."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for _ in range(5):
+        session_id = f"{int(time.time())}-{os.urandom(3).hex()}"
+        path = os.path.join(CACHE_DIR, session_id)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            continue
+        os.chmod(path, 0o700)
+        return session_id, path
+    raise FileExistsError(f"no free session dir name in {CACHE_DIR}")
+
+
 def update_meta(folder, fields):
     """Merge fields into <folder>/meta.json under a lock on the folder, so
     the transcriber and the screens collector never drop each other's keys."""
@@ -1290,7 +1312,8 @@ def start_locked(cfg, source, stale=None):
         return 1
     try:
         sink, mic = pactl_default("sink"), pactl_default("source")
-    except subprocess.SubprocessError as e:     # timed out / failed: transient
+    except (subprocess.SubprocessError, ValueError) as e:   # transient:
+        # timed out / failed / undecodable output (UnicodeDecodeError)
         if source != "teams":       # the watcher notifies when it gives up
             notify("Meeting recorder: could not start", str(e))
         print(f"cannot start (will retry): {e}", file=sys.stderr)
@@ -1326,9 +1349,14 @@ def start_locked(cfg, source, stale=None):
     sink, mic = pin_sink or sink, pin_mic or mic
     title = meeting_title(cfg)
 
-    # Unique per session: the raw dir and the id the screens worker checks.
-    session_id = f"{int(time.time())}-{os.urandom(3).hex()}"
-    sess_dir = os.path.join(CACHE_DIR, session_id)
+    # Unique per session: the raw dir (0700, ours: the rollback below may
+    # delete it) and the id the screens worker checks.
+    try:
+        session_id, sess_dir = new_session_dir()
+    except OSError as e:
+        notify("Meeting recorder: could not start", str(e))
+        print(f"failed to start: {e}", file=sys.stderr)
+        return 1
     sys_wav = os.path.join(sess_dir, "sys.wav")
     mic_wav = os.path.join(sess_dir, "mic.wav")
     # With AEC the raw mic is recorded too: finalize falls back to it if
@@ -1347,8 +1375,6 @@ def start_locked(cfg, source, stale=None):
     # any failure (or exception) stops what was spawned and removes the raw
     # dir, so nothing runs untracked by session.json.
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        make_private_dir(sess_dir)      # call audio + screenshots: 0700
         # Taken immediately before audio starts (after all the slow probes):
         # wall time names the folder, the monotonic origin times the frames.
         start_unix, origin = int(time.time()), time.monotonic()
@@ -2546,16 +2572,21 @@ def cmd_watch(args=()):
                 # poll instead of skipping the rest of this call; a
                 # transient probe failure: same, at most START_RETRIES
                 # times / START_RETRY_SECONDS, then give up for this call
-                rc = cmd_start(source="teams")
-                if rc == RETRY:
-                    retries, first_try = retries + 1, first_try or now
-                    if (retries >= START_RETRIES
-                            or now - first_try >= START_RETRY_SECONDS):
-                        notify("Meeting recorder: could not start recording",
-                               "Audio devices did not respond; this call is "
-                               "not being recorded.")
-                        handled = True
+                # (window checked BEFORE another attempt is launched)
+                if (first_try is not None
+                        and now - first_try >= START_RETRY_SECONDS):
+                    rc = None
                 else:
+                    rc = cmd_start(source="teams")
+                    if rc == RETRY:
+                        retries += 1
+                        first_try = now if first_try is None else first_try
+                if rc is None or (rc == RETRY and retries >= START_RETRIES):
+                    notify("Meeting recorder: could not start recording",
+                           "Audio devices did not respond; this call is "
+                           "not being recorded.")
+                    handled = True
+                elif rc != RETRY:
                     handled = rc != BUSY
         else:
             seen_since = None

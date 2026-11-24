@@ -1673,6 +1673,18 @@ class TestProcessIdentity(StateDirMixin, unittest.TestCase):
         self.assertTrue(mr.pid_alive(member))     # not ours to signal by group
         self.assertFalse(hasattr(mr, "group_members"))
 
+    def test_worker_without_saved_start_is_never_signalled(self):
+        # Codex (round 5): pid_alive(pid, None) let a bare (possibly
+        # reused) pid be SIGTERMed / SIGKILLed
+        p, start = self.child()
+        mr.stop_procs([], (p.pid, None), timeout=0.3)
+        self.assertIsNone(p.poll())
+        self.assertIn("not signalling screens worker", self.err.getvalue())
+        mr.write_state({"id": "x", "pids": [], "screens_pid": p.pid})
+        with mock.patch.object(mr, "finish_session", lambda *a, **k: 0):
+            mr.cmd_stop()
+        self.assertIsNone(p.poll())
+
     def test_reused_worker_pid_is_not_signalled(self):
         p, start = self.child(group=True)
         mr.stop_procs([], (p.pid, start + 1), timeout=0.3)
@@ -2056,7 +2068,7 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
             mr.write_state({"id": "old", "pids": [rec.pid],
                             "pid_starts": {str(rec.pid): rstart}})
             calls = []
-            with mock.patch.object(mr, "make_private_dir",
+            with mock.patch.object(mr, "new_session_dir",
                                    side_effect=OSError(errno.ENOSPC, "full")), \
                     mock.patch.object(mr, "finish_session",
                                       lambda st, cfg, **kw: calls.append(
@@ -2075,6 +2087,62 @@ class TestLifecycleLock(StateDirMixin, unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     cmd()
             self.assertEqual(calls, ["old2"], cmd.__name__)
+
+    def test_start_never_adopts_or_deletes_an_existing_dir(self):
+        # Codex (round 5): staging accepted an existing path and a failed
+        # start rmtree()d it. Creation is exclusive: a taken name is
+        # skipped, and only the dir this attempt made is rolled back.
+        self.start_env(die=("sys.wav",))
+        os.makedirs(mr.CACHE_DIR)
+        taken = os.path.join(mr.CACHE_DIR, "100-000001")
+        os.mkdir(taken)
+        Path(taken, "keep").write_text("not ours")
+        with mock.patch.object(mr.time, "time", lambda: 100.0), \
+                mock.patch.object(mr.os, "urandom",
+                                  side_effect=[b"\0\0\1", b"\0\0\2"]):
+            self.assertEqual(mr.new_session_dir(),
+                             ("100-000002", os.path.join(mr.CACHE_DIR, "100-000002")))
+        with mock.patch.object(mr.os, "urandom", side_effect=[b"\0\0\1"] * 5), \
+                mock.patch.object(mr.time, "time", lambda: 100.0):
+            self.assertRaises(FileExistsError, mr.new_session_dir)
+        with mock.patch.object(mr.os, "urandom", side_effect=[b"\0\0\1"] * 5), \
+                mock.patch.object(mr.time, "time", lambda: 100.0):
+            self.assertEqual(mr.cmd_start(), 1)       # no free name: fails
+        self.assertEqual(Path(taken, "keep").read_text(), "not ours")
+        self.assertEqual(mr.cmd_start(), 1)           # speaker recorder dies
+        self.assertEqual(sorted(os.listdir(mr.CACHE_DIR)),
+                         ["100-000001", "100-000002"])  # its own dir removed
+        self.assertEqual(Path(taken, "keep").read_text(), "not ours")
+
+    def test_undecodable_probe_output_is_a_bounded_retry(self):
+        # Codex (round 5): UnicodeDecodeError from pactl crashed cmd_watch
+        self.start_env()
+        bad = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        with mock.patch.object(mr.subprocess, "check_output", side_effect=bad):
+            self.assertEqual(mr.cmd_start(source="teams"), mr.RETRY)
+            real_start = mr.cmd_start
+            start, notes = self.watch_polls(15, lambda **kw: real_start(**kw))
+        self.assertEqual(start.call_count, mr.START_RETRIES)
+        self.assertEqual(len(notes), 1)
+        self.assertIsNone(mr.read_state())
+
+    def test_retry_window_is_checked_before_launching(self):
+        # Codex (round 5): a retry was launched at 61 s
+        clock, launched = [0.0], []
+
+        def fake_time():
+            clock[0] += 7.0
+            return clock[0]
+
+        def fake_start(**kw):
+            launched.append(clock[0])             # this poll's `now`
+            return mr.RETRY
+        with mock.patch.object(mr.time, "time", fake_time):
+            start, notes = self.watch_polls(12, fake_start)
+        self.assertTrue(launched)
+        self.assertLess(max(launched) - launched[0], mr.START_RETRY_SECONDS)
+        self.assertLess(start.call_count, mr.START_RETRIES)   # time ran out
+        self.assertEqual(len(notes), 1)
 
     def test_auto_toggle_writes_only_its_key(self):
         self.assertEqual(mr.cmd_auto(["off"]), 0)

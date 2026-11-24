@@ -303,7 +303,8 @@ rmdir'd only when empty; dry-run is the default.
   pidfd after the identity check. Signalling errors are printed, never
   raised, so finalization always runs.
 - `stop_procs`: recorders SIGINT, worker SIGTERM, wait 5 s, SIGKILL
-  survivors -- only those identity-checked pids. Fix round 5 removed the
+  survivors -- only those identity-checked pids; a worker with no saved
+  start time is never signalled (logged; fix round 6). Fix round 5 removed the
   process-group enumeration (`group_members`): a group id can be reused
   between any check and the scan, so it could authorize signals to an
   unrelated process (Codex). Capture children are instead bound to the
@@ -317,15 +318,19 @@ rmdir'd only when empty; dry-run is the default.
   bounded (`pactl get-default-*` 5 s, `run_json` 5 s, `notify-send` 5 s).
   Busy = exit 75 (`BUSY`); the watcher retries a busy start/stop next poll
   instead of marking the call handled. A `pactl get-default-*` that times
-  out or fails is transient: start exits 76 (`RETRY`) and the watcher
+  out, fails or prints undecodable output is transient: start exits 76 (`RETRY`) and the watcher
   retries every poll while the call lasts, at most `START_RETRIES` (10)
-  times / `START_RETRY_SECONDS` (60 s), then notifies "could not start
+  times / `START_RETRY_SECONDS` (60 s; checked before each attempt, so
+  none launches after 60 s), then notifies "could not start
   recording" and leaves the call alone (fix round 5; one timeout used to
   skip the whole call). A manual start notifies at once.
 - A crashed session that start/toggle recovered is mixed in a `finally`
   (`finish_stale`), so a new start that fails (ENOSPC on the staging dir)
   or raises never strands it; the staging dir is created inside start's
-  guarded block, so that failure is a clean exit 1. Not persisted across
+  guarded block, so that failure is a clean exit 1. The staging dir is
+  made exclusively (`new_session_dir`: `os.mkdir`, a new name on EEXIST),
+  so start's rollback only ever deletes a dir it created (fix round 6).
+  Not persisted across
   process death (if start itself is killed mid-way, the WAVs stay in
   `~/.cache/meet-recorder/<id>/`).
 - The watcher stops by identity: `cmd_stop(expect_id=…, expect_source=
