@@ -20,6 +20,14 @@ with faster-whisper. Zero network/cloud use at runtime.
 
 ## Hard rules
 
+Retention: `meet-recorder prune [--days N] [--apply]` archives the text
+artifacts of meetings in date folders >= N days old into
+`~/Recordings/.archive/<date>_<folder>.tar.gz` and deletes the meeting
+folder (audio + screens) only after the archive reopens clean.
+Invariants: only `YYYY-MM-DD` dirs under `output_dir` are considered;
+symlinks and non-meeting subdirs are never deleted; date dirs are
+rmdir'd only when empty; dry-run is the default.
+
 1. **The venv `~/venvs/meet-recorder/` is read-only.** PyAV is pinned to
    `av==15.1.0`: av>=16 removes the `metadata_errors` kwarg faster-whisper
    1.2.1 needs; av<=14 never had it. Never `pip install -U av`.

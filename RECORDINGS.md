@@ -35,6 +35,19 @@ folder. This file is installed from `~/meet-recorder/RECORDINGS.md`.
         └── transcribe.log              transcription log (only useful if something failed)
 ```
 
+## Retention
+
+`meet-recorder prune --apply` (weekly timer) archives every meeting
+folder that is 45+ days old: the text artifacts (`transcript.*`,
+`segments.json`, `meta.json`, `screens.json`, `moments.md`,
+`summary.md`) are tar'd into `~/Recordings/.archive/<date>_<folder>.tar.gz`
+and the folder -- audio and screens included -- is deleted only after
+that archive verifies. The `.archive/` stash is uploaded to the
+Meetings Archive Google Drive folder from the VPS and dropped locally
+once Drive confirms the upload. Date folders are removed once empty;
+anything that isn't a positively identified meeting folder is kept.
+Run `meet-recorder prune` without `--apply` to see the plan first.
+
 Screen frames are only kept when the window content changes and then holds
 still for a few seconds (slides, shared documents). Areas that keep moving
 (live camera tiles beside a shared slide) are ignored, so a slide is still

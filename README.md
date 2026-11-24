@@ -41,6 +41,10 @@ meet-recorder start     # start recording (refuses if already recording)
 meet-recorder stop      # stop, mix, print output folder; transcribes in the background
 meet-recorder toggle    # start if idle, stop if recording
 meet-recorder status    # "recording <elapsed-seconds>" or "idle"
+meet-recorder prune     # plan what >=45-day-old meetings would be pruned
+meet-recorder prune --apply [--days N]
+                        # tar the text artifacts of old meetings into
+                        # ~/Recordings/.archive/, delete the rest
 ```
 
 `start` resolves the default sink and source, spawns two mono 16 kHz

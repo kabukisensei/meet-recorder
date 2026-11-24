@@ -8,6 +8,7 @@ network calls, ever. faster-whisper is imported lazily, only at transcribe time.
 
 import configparser
 import contextlib
+import datetime
 import fcntl
 import io
 import json
@@ -20,6 +21,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 
 STATE_DIR = os.path.expanduser("~/.local/state/meet-recorder")
@@ -2417,12 +2419,151 @@ def cmd_watch(args=()):
         time.sleep(max(0.5, cfg.getfloat("auto", "poll_seconds")))
 
 
+
+# --------------------------------------------------------------------------- #
+# Retention: prune old meetings (archive text artifacts, delete the rest)
+# --------------------------------------------------------------------------- #
+
+PRUNE_TEXT_ARTIFACTS = (
+    "transcript.md", "transcript.txt", "transcript.vtt",
+    "segments.json", "meta.json", "screens.json",
+    "moments.md", "summary.md",
+)
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+PRUNE_STASH_DIR = ".archive"
+
+
+def prune_plan(date_names, today, keep_days):
+    """Partition date-folder names into (prune, keep).
+
+    Pure. date_names are 'YYYY-MM-DD' basename strings; today is a
+    datetime.date. A folder is pruned once its age in whole days reaches
+    keep_days, i.e. keep_days=45 prunes a folder that is 45 days old.
+    Names that don't parse as ISO dates are always kept.
+    """
+    prune, keep = [], []
+    for name in sorted(date_names):
+        try:
+            day = datetime.date.fromisoformat(name)
+        except ValueError:
+            keep.append(name)
+            continue
+        (prune if (today - day).days >= keep_days else keep).append(name)
+    return prune, keep
+
+
+def meeting_folder_marker(folder):
+    """True when folder holds at least one known meeting artifact, so prune
+    never deletes a directory it can't positively identify."""
+    for name in ("meeting.m4a", "transcript.md", "transcript.txt"):
+        if os.path.isfile(os.path.join(folder, name)):
+            return True
+    return False
+
+
+def build_archive(folder, tar_path):
+    """tar.gz the text artifacts of one meeting folder into tar_path, then
+    verify by reopening. Returns the archived member names. Raises rather
+    than publishing a bad archive: the caller keeps the meeting folder when
+    this fails."""
+    members = [n for n in PRUNE_TEXT_ARTIFACTS
+               if os.path.isfile(os.path.join(folder, n))]
+    if not members:
+        raise ValueError("no text artifacts to archive")
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for name in members:
+            tar.add(os.path.join(folder, name), arcname=name)
+    with tarfile.open(tar_path) as tar:
+        if sorted(tar.getnames()) != sorted(members):
+            raise ValueError("archive verification failed")
+    return members
+
+
+def cmd_prune(args=()):
+    """prune [--days N] [--apply] -- archive+delete meetings older than N days.
+
+    Meetings live under <output_dir>/<YYYY-MM-DD>/<HHMMSS-source>/; a date
+    folder is pruned once it is >= N days old (default 45). Per meeting
+    folder, the text artifacts are tar'd into
+    <output_dir>/.archive/<date>_<folder>.tar.gz and the folder is deleted
+    only after that archive verifies; the audio and screens are dropped.
+    Date folders are removed once empty. Anything that is not a positively
+    identified meeting folder is kept. Without --apply this prints the plan
+    and changes nothing.
+    """
+    days, apply = 45, False
+    it = iter(args)
+    for a in it:
+        if a == "--days":
+            try:
+                days = int(next(it))
+            except (StopIteration, ValueError):
+                print("prune: --days needs an integer", file=sys.stderr)
+                return 2
+        elif a == "--apply":
+            apply = True
+        else:
+            print(f"prune: unknown arg: {a}", file=sys.stderr)
+            return 2
+    if days < 1:
+        print("prune: --days must be >= 1", file=sys.stderr)
+        return 2
+    base = os.path.expanduser(load_config().get("paths", "output_dir"))
+    try:
+        names = os.listdir(base)
+    except OSError as e:
+        print(f"prune: {e}", file=sys.stderr)
+        return 1
+    prune, _keep = prune_plan([n for n in names if _DATE_DIR_RE.match(n)],
+                              datetime.date.today(), days)
+    if not prune:
+        print(f"prune: nothing >= {days} days old under {base}")
+        return 0
+    if not apply:
+        for name in prune:
+            subs = sorted(os.listdir(os.path.join(base, name)))
+            print(f"prune [dry-run]: {name}: {', '.join(subs)}")
+        print("prune: dry run -- re-run with --apply to execute")
+        return 0
+    make_private_dir(stash := os.path.join(base, PRUNE_STASH_DIR))
+    for name in prune:
+        d = os.path.join(base, name)
+        if os.path.islink(d):
+            print(f"prune: skip (symlink): {d}", file=sys.stderr)
+            continue
+        for sub in sorted(os.listdir(d)):
+            folder = os.path.join(d, sub)
+            if os.path.islink(folder) or not os.path.isdir(folder):
+                print(f"prune: skip (not a plain folder): {folder}",
+                      file=sys.stderr)
+                continue
+            if not meeting_folder_marker(folder):
+                print(f"prune: skip (no meeting artifacts, kept): {folder}",
+                      file=sys.stderr)
+                continue
+            tar_path = os.path.join(stash, f"{name}_{sub}.tar.gz")
+            try:
+                members = build_archive(folder, tar_path)
+            except (OSError, ValueError, tarfile.TarError) as e:
+                print(f"prune: archive failed, keeping {folder}: {e}",
+                      file=sys.stderr)
+                continue
+            shutil.rmtree(folder)
+            print(f"prune: archived {len(members)} text files, "
+                  f"deleted {folder}")
+        if os.path.isdir(d) and not os.listdir(d):
+            os.rmdir(d)
+            print(f"prune: removed empty {d}")
+    return 0
+
+
 COMMANDS = {"start": cmd_start, "stop": cmd_stop, "toggle": cmd_toggle,
             "status": cmd_status, "auto": cmd_auto, "watch": cmd_watch,
             "transcribe": cmd_transcribe, "export": cmd_export,
             "moments": cmd_moments, "link-screens": cmd_link_screens,
             "screens-loop": cmd_screens_loop,
-            "collect-screens": cmd_collect_screens, "latest": cmd_latest}
+            "collect-screens": cmd_collect_screens, "latest": cmd_latest,
+            "prune": cmd_prune}
 
 
 def main(argv=None):
@@ -2431,7 +2572,8 @@ def main(argv=None):
         print("usage: meet-recorder start|stop|toggle|status [--json]|"
               "auto on|off|toggle|watch|transcribe <folder>|"
               "export <folder>...|moments <folder>...|"
-              "link-screens <folder>...", file=sys.stderr)
+              "link-screens <folder>...|"
+              "prune [--days N] [--apply]", file=sys.stderr)
         return 2
     return COMMANDS[argv[0]](argv[1:])
 

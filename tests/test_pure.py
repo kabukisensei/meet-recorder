@@ -8,6 +8,7 @@ because the script has no .py extension.
 import importlib.machinery
 import importlib.util
 import contextlib
+import datetime
 import html
 import io
 import json
@@ -17,6 +18,7 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -30,6 +32,132 @@ _spec = importlib.util.spec_from_loader(
     "meet_recorder", importlib.machinery.SourceFileLoader("meet_recorder", CLI_PATH))
 mr = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mr)
+
+
+class TestPrunePlan(unittest.TestCase):
+    TODAY = datetime.date(2026, 11, 24)
+
+    def test_prunes_past_boundary_keeps_inside(self):
+        prune, keep = mr.prune_plan(["2026-09-10", "2026-10-11"],
+                                    self.TODAY, 45)
+        self.assertEqual(prune, ["2026-09-10"])
+        self.assertEqual(keep, ["2026-10-11"])
+
+    def test_exact_boundary_age_is_pruned(self):
+        # 2026-10-10 is exactly 45 days before TODAY
+        prune, keep = mr.prune_plan(["2026-10-10"], self.TODAY, 45)
+        self.assertEqual(prune, ["2026-10-10"])
+
+    def test_today_and_yesterday_kept(self):
+        prune, keep = mr.prune_plan(["2026-11-24", "2026-11-23"],
+                                    self.TODAY, 45)
+        self.assertEqual(prune, [])
+        self.assertEqual(keep, ["2026-11-23", "2026-11-24"])
+
+    def test_unparseable_names_kept(self):
+        prune, keep = mr.prune_plan(["not-a-date", "2026-13-01"],
+                                    self.TODAY, 1)
+        self.assertEqual(prune, [])
+        self.assertEqual(keep, ["2026-13-01", "not-a-date"])
+
+    def test_sorted_output(self):
+        prune, _keep = mr.prune_plan(["2026-09-12", "2026-09-05"],
+                                     self.TODAY, 1)
+        self.assertEqual(prune, ["2026-09-05", "2026-09-12"])
+
+
+class TestPruneCmd(unittest.TestCase):
+    def _meeting(self, base, date, sub="104529-meeting"):
+        folder = os.path.join(base, date, sub)
+        os.makedirs(folder)
+        with open(os.path.join(folder, "transcript.md"), "w") as f:
+            f.write("# meeting\nwords\n")
+        with open(os.path.join(folder, "transcript.txt"), "w") as f:
+            f.write("[00:00 -> 00:05] words\n")
+        with open(os.path.join(folder, "meeting.m4a"), "wb") as f:
+            f.write(b"audio")
+        with open(os.path.join(folder, "summary.md"), "w") as f:
+            f.write("summary\n")
+        return folder
+
+    def _run_prune(self, base, args):
+        cfg_path = os.path.join(os.path.dirname(base), "config.ini")
+        with open(cfg_path, "w") as f:
+            f.write(f"[paths]\noutput_dir = {base}\n")
+        with mock.patch.object(mr, "CONFIG_FILE", cfg_path):
+            return mr.cmd_prune(args)
+
+    def test_dry_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Recordings")
+            folder = self._meeting(base, "2026-09-01")
+            rc = self._run_prune(base, ["--days", "45"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isdir(folder))
+            self.assertFalse(os.path.exists(os.path.join(base, ".archive")))
+
+    def test_apply_archives_text_and_deletes_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Recordings")
+            folder = self._meeting(base, "2026-09-01")
+            rc = self._run_prune(base, ["--days", "45", "--apply"])
+            self.assertEqual(rc, 0)
+            self.assertFalse(os.path.exists(folder))
+            tar_path = os.path.join(base, ".archive",
+                                    "2026-09-01_104529-meeting.tar.gz")
+            self.assertTrue(os.path.isfile(tar_path))
+            with tarfile.open(tar_path) as tar:
+                self.assertEqual(sorted(tar.getnames()),
+                                 ["summary.md", "transcript.md",
+                                  "transcript.txt"])
+
+    def test_apply_removes_empty_date_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Recordings")
+            self._meeting(base, "2026-09-01")
+            self._run_prune(base, ["--days", "45", "--apply"])
+            self.assertFalse(os.path.exists(os.path.join(base, "2026-09-01")))
+
+    def test_unidentified_subdir_survives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Recordings")
+            self._meeting(base, "2026-09-01")
+            mystery = os.path.join(base, "2026-09-01", "my-stuff")
+            os.makedirs(mystery)
+            with open(os.path.join(mystery, "note.txt"), "w") as f:
+                f.write("keep me\n")
+            rc = self._run_prune(base, ["--days", "45", "--apply"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(os.path.join(mystery, "note.txt")))
+            self.assertTrue(os.path.isdir(os.path.join(base, "2026-09-01")))
+
+    def test_symlink_date_dir_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Recordings")
+            real = os.path.join(tmp, "real-2026-09-01")
+            self._meeting(base, "2026-09-01")
+            os.rename(os.path.join(base, "2026-09-01"), real)
+            os.symlink(real, os.path.join(base, "2026-09-01"))
+            rc = self._run_prune(base, ["--days", "45", "--apply"])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(os.path.join(
+                real, "104529-meeting", "transcript.md")))
+
+    def test_days_must_be_positive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Recordings")
+            self._meeting(base, "2026-09-01")
+            self.assertEqual(self._run_prune(base, ["--days", "0"]), 2)
+            self.assertEqual(self._run_prune(base, ["--days", "x"]), 2)
+            self.assertTrue(os.path.isdir(os.path.join(base, "2026-09-01")))
+
+    def test_nothing_old_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = os.path.join(tmp, "Recordings")
+            folder = self._meeting(base, "2026-11-23")
+            self.assertEqual(
+                self._run_prune(base, ["--days", "45", "--apply"]), 0)
+            self.assertTrue(os.path.isdir(folder))
 
 
 class TestFmtTs(unittest.TestCase):
