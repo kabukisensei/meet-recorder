@@ -145,7 +145,7 @@ with faster-whisper. Zero network/cloud use at runtime.
   Keep rule (`screen_keep_step`, pure, state = last `volatile_window` "moved"
   bitmaps + mask): a cell *moved* if its diff to the previous tick >
   `stable_threshold` (0.02). A cell is *volatile* once it moved in ≥
-  `volatile_ticks` (3) of the last `volatile_window` (5) ticks and stays so
+  `volatile_ticks` (2) of the last `volatile_window` (5) ticks and stays so
   until it has not moved for 5 ticks (hysteresis, so low-motion video does
   not flicker in and out). Volatile cells are ignored: *settled* = no calm
   cell moved for `settle_ticks` (2) ticks; *new* = ≥ `change_fraction` (3 %)
@@ -154,8 +154,13 @@ with faster-whisper. Zero network/cloud use at runtime.
   (0.005). > `max_volatile` (85 %) volatile (full-window video, gallery) →
   nothing kept. Then `min_gap_seconds` / `max_frames`. A failed sample, a
   missing window or a different stableId resets the history (no stale diff).
+  Why 2 (not the 3 first tried): live, a random strip cell sometimes holds
+  still for one tick; 3-of-5 then took ~15 s to warm up and missed a first
+  slide shown for 15 s (measured). A slide change moves its cells on one
+  tick, so it is never masked; one caught on 2 consecutive ticks (slow build
+  animation) is masked and kept ≤ 5 ticks later instead.
   Consequences: a slide with a live strip is kept ~2 ticks after the strip
-  turns volatile (first slide ~12 s in) or after the slide changes (~6 s);
+  turns volatile (first slide ~9 s in) or after the slide changes (~6 s);
   a camera-only call with static Teams chrome (< 85 % video) keeps one frame
   at the start; a camera that stops moving makes its cells eligible again
   after 5 ticks (one extra frame if that changed the picture).

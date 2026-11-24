@@ -808,22 +808,22 @@ class TestKeepRule(unittest.TestCase):
     def test_static_slides_with_live_strip_kept_once_each(self):
         s = Screen()
         frames = [s.frame(k) for k in (0, 1, 2, 3) for _ in range(10)]
-        # strip becomes volatile on tick 3, settled 2 ticks -> keep at tick 4;
-        # later slides settle 2 ticks after they appear
-        self.assertEqual(run_keeps(frames), [12.0, 36.0, 66.0, 96.0])
+        # strip volatile on tick 2 (moved on ticks 1 and 2), settled on
+        # ticks 2 and 3 -> keep at tick 3; later slides 2 ticks after they appear
+        self.assertEqual(run_keeps(frames), [9.0, 36.0, 66.0, 96.0])
 
     def test_text_change_while_strip_moves_is_new(self):
         s = Screen()
         line = (10, 20, 100, 25)                           # one new text line
         frames = [s.frame(0) for _ in range(10)] + \
                  [s.frame(0, lines=[line]) for _ in range(10)]
-        self.assertEqual(run_keeps(frames), [12.0, 36.0])
+        self.assertEqual(run_keeps(frames), [9.0, 36.0])
 
     def test_caret_sized_change_is_not_new(self):
         s = Screen()
         frames = [s.frame(0) for _ in range(10)] + \
                  [s.frame(0, lines=[(10, 20, 13, 25)]) for _ in range(10)]
-        self.assertEqual(run_keeps(frames), [12.0])
+        self.assertEqual(run_keeps(frames), [9.0])
 
     def test_full_window_video_keeps_nothing(self):
         s = Screen()
@@ -836,23 +836,42 @@ class TestKeepRule(unittest.TestCase):
 
     def test_cell_that_stops_being_volatile_is_eligible_again(self):
         s = Screen()
-        moving = [s.frame(0) for _ in range(10)]              # keep at 12 s
+        moving = [s.frame(0) for _ in range(10)]              # keep at 9 s
         frozen = [s.frame(0, strip="static") for _ in range(8)]
         # a change that lives only in the (former) strip region
         changed = [s.frame(0, strip="static", lines=[(0, 62, 120, 70)])
                    for _ in range(8)]
         times = run_keeps(moving + frozen + changed)
-        self.assertEqual(times[0], 12.0)
+        self.assertEqual(times[0], 9.0)
         # the frozen strip itself differs from the kept frame once it calms
         # down (a camera turned off is a real layout change) ...
         self.assertEqual(len([t for t in times if 30 <= t < 54]), 1)
         # ... and a later change inside the region is seen again
         self.assertEqual(len([t for t in times if t >= 54]), 1)
 
+    def test_strip_holding_still_for_a_tick_does_not_delay_warm_up(self):
+        # measured live: a random strip cell can repeat itself for one tick;
+        # the first slide (shown 15 s from the start) must still be kept
+        s = Screen()
+        frames = [s.frame(0) for _ in range(5)]
+        frames[2] = frames[1]
+        frames += [s.frame(1) for _ in range(5)]
+        self.assertEqual(run_keeps(frames), [9.0, 21.0])
+
+    def test_two_tick_change_is_masked_then_kept_later(self):
+        # both build steps land in the same cell row (y 24-29) on ticks 10
+        # and 11 -> that row is masked from tick 11, still from tick 12, calm
+        # again after 5 still ticks (tick 16) and then kept: later, not lost
+        s = Screen()
+        frames = ([s.frame(0) for _ in range(10)]
+                  + [s.frame(0, lines=[(10, 24, 100, 27)])]
+                  + [s.frame(0, lines=[(10, 24, 100, 29)]) for _ in range(10)])
+        self.assertEqual(run_keeps(frames), [9.0, 48.0])
+
     def test_while_volatile_the_strip_is_ignored(self):
         s = Screen()
         frames = [s.frame(0) for _ in range(30)]
-        self.assertEqual(run_keeps(frames), [12.0])
+        self.assertEqual(run_keeps(frames), [9.0])
 
     def test_min_gap_delays_keep(self):
         s = Screen()

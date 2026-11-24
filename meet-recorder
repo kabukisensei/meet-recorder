@@ -59,7 +59,7 @@ DEFAULTS = {
     "screens": {"enabled": "true", "window_class": "teams-for-linux",
                 "interval_seconds": "3", "stable_threshold": "0.02",
                 "cell_change_threshold": "0.02", "change_fraction": "0.03",
-                "change_threshold": "0.005", "volatile_ticks": "3",
+                "change_threshold": "0.005", "volatile_ticks": "2",
                 "volatile_window": "5", "max_volatile": "0.85",
                 "settle_ticks": "2", "min_gap_seconds": "10",
                 "max_frames": "300", "max_mb": "300", "min_free_mb": "1024",
@@ -531,6 +531,12 @@ def screen_keep_step(state, d_prev, d_kept, t, p):
     it moved in >= volatile_ticks of the last volatile_window ticks, and
     stays volatile until it has not moved at all for volatile_window ticks
     (hysteresis: low-motion video must not flicker in and out of the mask).
+    volatile_ticks defaults to 2 (not 3): live, a random camera-ish strip
+    cell sometimes holds still for a tick, and 3-of-5 then needed ~15 s of
+    warm-up, missing a first slide shown for 15 s. A one-off slide change
+    moves its cells on one tick only, so it is never masked; a change
+    caught on two consecutive ticks (slow build animation) is masked and
+    kept up to volatile_window ticks later instead.
     Volatile cells are ignored for both decisions:
       settled = no calm cell moved, for settle_ticks ticks in a row;
       new     = >= change_fraction of the calm cells differ from the kept
