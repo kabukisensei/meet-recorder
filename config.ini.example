@@ -3,15 +3,17 @@ sys_volume = 1.0
 mic_volume = 2.0
 sample_rate = 16000
 # Which source the "Me" track records:
-#   auto  - echo-cancel the mic the call uses (a private PipeWire process
-#           started for the recording only, never visible to Teams) and
-#           record the raw mic too; the echo-cancelled track is used only if
-#           it is complete and never went silent while the raw mic had sound.
-#           Skipped (raw mic) when the call app plays to a non-default
-#           speaker. With speakers this removes the far side from me.m4a.
-#   raw   - always the default mic (the old behaviour).
+#   raw   - the mic the call uses (default; follows the default mic).
+#   auto  - raw as above, PLUS an echo-cancelled extra track of that mic (a
+#           private PipeWire process started after the recorders, for the
+#           recording only, never visible to Teams). The extra track is used
+#           only if it is complete, kept your voice, and the call's mic and
+#           speaker never changed; otherwise the raw mic is used. Skipped
+#           when the call app plays to a non-default speaker. With speakers
+#           this removes the far side from me.m4a. Opt-in until it has
+#           passed a real call.
 #   <node.name> - a specific PipeWire source (no echo cancellation).
-mic_source = auto
+mic_source = raw
 
 [whisper]
 model = small
@@ -53,17 +55,20 @@ interval_seconds = 3
 # (camera tiles, speaking rings) is "volatile" and ignored: volatile after
 # moving in volatile_ticks of the last volatile_window ticks, calm again after
 # volatile_window still ticks. A frame is kept when no calm cell moved by
-# more than stable_threshold for settle_ticks ticks AND (change_fraction of
-# the calm cells differ from the last kept frame by > cell_change_threshold,
-# or their mean difference is >= change_threshold). Nothing is kept while
-# more than max_volatile of the window is volatile (full-screen video).
+# more than stable_threshold for settle_ticks ticks AND the calm cells that
+# differ from the last kept frame by > cell_change_threshold include ONE
+# connected region (cells up to one empty cell apart) of at least
+# region_fraction of the whole window: a slide/doc/share, not speaking rings,
+# name labels or gallery reflow. Nothing is kept while more than
+# max_volatile of the window is volatile (full-screen video), or while the
+# window is narrower than min_width logical px (a narrow tile).
 # A tick on which >= burst_fraction of the cells start moving after 2 still
 # ticks is a transition (slide change, fade): those moves, and the cells'
 # next transition_ticks - 1 moves, are not counted as video.
 stable_threshold = 0.02
 cell_change_threshold = 0.02
-change_fraction = 0.03
-change_threshold = 0.005
+region_fraction = 0.25
+min_width = 900
 volatile_ticks = 2
 volatile_window = 5
 max_volatile = 0.85

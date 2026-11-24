@@ -52,11 +52,14 @@ once Drive confirms the upload. Date folders are removed once empty;
 anything that isn't a positively identified meeting folder is kept.
 Run `meet-recorder prune` without `--apply` to see the plan first.
 
-Screen frames are only kept when the window content changes and then holds
-still for a few seconds (slides, shared documents). Areas that keep moving
-(live camera tiles beside a shared slide) are ignored, so a slide is still
-captured while people are on camera; a window that is almost all live video
-produces no frames. The `screens/`, `screens.json` and `moments.md` entries
+Screen frames are only kept when a large part of the window (one connected
+area of at least a quarter of it) changes and then holds still for a few
+seconds (slides, shared documents). Small scattered changes -- speaking
+rings, name labels, tiles moving around in the gallery -- are not kept.
+Areas that keep moving (live camera tiles beside a shared slide) are
+ignored, so a slide is still captured while people are on camera; a window
+that is almost all live video produces no frames, and neither does a Teams
+window narrower than 900 px (a share in a narrow tile is unreadable). The `screens/`, `screens.json` and `moments.md` entries
 are absent when nothing was kept. Screenshots are private to your user
 (`screens/` is 0700, the images 0600). They are copied in by a separate job
 right after the recording is saved, so they can appear a few seconds after
@@ -68,11 +71,13 @@ the audio.
   e.g. `101502-teams-weekly-ops-sync`.
 - Speaker labels: `Me` is whatever your microphone picked up, `Others` is the
   call audio. Individual participants are not told apart or named. When the
-  call plays through speakers, the mic is recorded through PipeWire echo
-  cancellation (`mic_echo_cancel: true` in meta.json), and whatever echo is
-  left is filtered out of the transcript. Recordings from before 2026-11-24,
-  or where the echo-cancelled track was not usable (then the raw mic is used,
-  see `mic_track_reason`), have `mic_echo_cancel: false` or no such field.
+  call plays through speakers the mic also hears the far side; that echo is
+  filtered out of the transcript. Echo cancellation (`[audio] mic_source =
+  auto`, off by default) records an extra echo-cancelled mic track that is
+  used only when it proved complete (`mic_echo_cancel: true` in meta.json;
+  otherwise `mic_track_reason` says why the raw mic was used).
+  `audio_unverified` in meta.json means an encoded file came out short; the
+  original WAVs are then kept in the folder named by `wavs_kept_in`.
 - Folders from before 2026-11-23 12:00 are named `HHMMSS-meeting`, have no `meta.json`,
   and their transcripts have no speaker labels.
 

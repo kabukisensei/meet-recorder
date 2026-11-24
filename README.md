@@ -93,8 +93,8 @@ sys_volume = 1.0
 mic_volume = 2.0
 # capture + mix sample rate (Hz)
 sample_rate = 16000
-# auto | raw | <PipeWire node.name> (see below)
-mic_source = auto
+# raw | auto | <PipeWire node.name> (see below)
+mic_source = raw
 
 [whisper]
 # faster-whisper model size
@@ -116,8 +116,11 @@ be on their own line: an inline `# ...` would become part of the value.
 
 ### Echo-free mic track
 
-With speakers, the mic also hears the far side. With `mic_source = auto`, each
-recording starts its own small PipeWire client process
+With speakers, the mic also hears the far side. Echo cancellation is
+**opt-in** (`mic_source = auto`) until it has passed a real call; the default
+`raw` records the mic as before. With `auto`, each recording first starts the
+speaker and raw mic recorders exactly as before, then (within 3 s, never
+delaying them) its own small PipeWire client process
 (`pipewire -c ~/.cache/meet-recorder/<id>/aec.conf`) running WebRTC echo
 cancellation on the mic the call uses, with the default speaker's monitor
 as the echo reference. The PipeWire daemon never loads it, and nothing in
@@ -125,11 +128,15 @@ as the echo reference. The PipeWire daemon never loads it, and nothing in
 desktop never offers it as a mic, it never becomes the default, and Teams
 cannot see it. The process exits when the recording stops.
 
-The raw mic is recorded too. The echo-cancelled track is used only if it
-has no gaps and never went silent for 10 s while the raw mic picked up
-sound. Otherwise the raw mic is used. If the call app plays to a
-non-default speaker, the raw mic is used. `meta.json` says which track was
-used (`mic_echo_cancel`, `mic_track_reason`).
+The echo-cancelled track is an extra; the raw mic is always the primary. It
+is used only if it is complete (length matches), it kept your voice (in at
+least 80 % of the 10 s windows where the raw mic heard you speak while the
+far side was quiet), and the call's mic and speaker never moved away from
+the ones it was set up on (checked every 10 s by the watcher and at stop).
+Otherwise the raw mic is used. If the call app plays to a non-default
+speaker, no canceller is started. `meta.json` says which track was used
+(`mic_echo_cancel`, `mic_track_reason`). The WAVs are deleted only after
+the encoded audio verified at full length.
 
 `[whisper] initial_prompt` gives whisper a vocabulary line (names, product
 terms) for both tracks; see `config.ini.example`.
@@ -157,8 +164,10 @@ recordings; Teams-format WebVTT that FocusTime imports).
 ## Screen moments
 
 While recording, a background `screens-loop` (needs `grim` + `hyprctl`) checks
-the Teams window every 3 s and keeps a JPEG whenever its content changes and
-then settles — a new slide, a shared document — but not live video. After
+the Teams window every 3 s and keeps a JPEG whenever a large part of it (one
+connected region of at least 25 %) changes and then settles — a new slide, a
+shared document — but not live video, speaking rings or name labels. Nothing
+is captured while the window is narrower than `min_width` (900 px). After
 transcription, `moments.md` pairs each frame with what was said around it,
 and `meet-recorder-summarize` (also in this repo) tags action items/decisions
 with `[mm:ss]` and links the matching frame (`link-screens`). Images never

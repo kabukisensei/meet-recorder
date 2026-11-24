@@ -39,7 +39,9 @@ LOCK_FILE = os.path.join(STATE_DIR, "lock")          # serializes start/stop
 
 DEFAULTS = {
     "audio": {"sys_volume": "1.0", "mic_volume": "2.0", "sample_rate": "16000",
-              "mic_source": "auto"},
+              # raw until the echo canceller has passed a real call;
+              # `auto` opts in (see NOTES.md "Echo-cancelled mic").
+              "mic_source": "raw"},
     "whisper": {"model": "small", "device": "cpu",
                 "compute_type": "int8", "beam_size": "5",
                 # Vocabulary/context for both tracks (names, product terms).
@@ -64,8 +66,8 @@ DEFAULTS = {
     # screen_keep_step and NOTES.md for why these values.
     "screens": {"enabled": "true", "window_class": "teams-for-linux",
                 "interval_seconds": "3", "stable_threshold": "0.02",
-                "cell_change_threshold": "0.02", "change_fraction": "0.03",
-                "change_threshold": "0.005", "volatile_ticks": "2",
+                "cell_change_threshold": "0.02", "region_fraction": "0.25",
+                "min_width": "900", "volatile_ticks": "2",
                 "volatile_window": "5", "max_volatile": "0.85",
                 "burst_fraction": "0.1", "transition_ticks": "2",
                 "settle_ticks": "2", "min_gap_seconds": "10",
@@ -382,8 +384,10 @@ def app_device(streams, devices, apps, key, default):
 # own pw-record (target.object = its name) is ever linked to it.
 AEC_PREFIX = "meet-recorder.aec"
 AEC_MEDIA_CLASS = "Stream/Output/Audio/Internal"
-AEC_NODE_WAIT = 4.0       # s for the helper's nodes to appear
-AEC_LINK_WAIT = 3.0       # s for WirePlumber to link our recorder to it
+# Total time start may spend on the canceller (helper spawn -> output node
+# -> our recorder linked). It runs AFTER the speaker and raw mic recorders
+# are already recording, so it can never delay or cost the primary tracks.
+AEC_BUDGET = 3.0
 
 
 def aec_names(session_id):
@@ -462,13 +466,21 @@ context.modules = [
 """
 
 
+# PIPEWIRE_* variables the helper may keep: which daemon to talk to.
+AEC_ENV_KEEP = {"PIPEWIRE_REMOTE", "PIPEWIRE_RUNTIME_DIR"}
+
+
 def aec_env(env=None):
-    """Environment for the AEC helper: drop variables that would load
-    another config instead of ours or force autoconnect on its output."""
+    """Environment for the AEC helper: every PIPEWIRE_* variable except the
+    daemon address is dropped. PIPEWIRE_CONFIG_* would load another config
+    instead of ours, PIPEWIRE_AUTOCONNECT forces autoconnect on our output,
+    and PIPEWIRE_PROPS / PIPEWIRE_NODE / PIPEWIRE_LATENCY ... are applied
+    AFTER the configured stream properties (stream.c), so an inherited
+    `media.class` could make the private output visible as a source."""
     env = dict(os.environ if env is None else env)
-    for k in ("PIPEWIRE_CONFIG_NAME", "PIPEWIRE_CONFIG_PREFIX",
-              "PIPEWIRE_CONFIG_DIR", "PIPEWIRE_AUTOCONNECT"):
-        env.pop(k, None)
+    for k in list(env):
+        if k.startswith("PIPEWIRE_") and k not in AEC_ENV_KEEP:
+            env.pop(k)
     return env
 
 
@@ -534,10 +546,12 @@ def plan_mic(setting, sources, mic, pin_sink="", pin_mic=""):
     setting: mic_source_setting(); sources: parsed `pactl -f json list
     sources`; mic: the mic the call uses (pin_mic or the default source);
     pin_sink / pin_mic: app_device() results ('' = default).
-    Returns (aec, target, note): aec = run the echo canceller on `mic`;
-    target = what the raw-mic recorder pins ('' = follow the default).
-    With AEC the raw recorder always pins the real mic node explicitly.
-    Never fails: anything doubtful records the raw mic as before.
+    Returns (aec, target, note): aec = also record an echo-cancelled
+    track of `mic`; target = what the raw-mic recorder pins ('' = follow
+    the default). The raw recorder is exactly the pre-AEC one either way
+    (pin_mic or the default), so it follows a default-mic switch like the
+    call app does; AEC is only an extra track. Never fails: anything
+    doubtful records the raw mic only.
     """
     if setting == "raw":
         return False, pin_mic, "raw mic (mic_source = raw)"
@@ -552,90 +566,148 @@ def plan_mic(setting, sources, mic, pin_sink="", pin_mic=""):
     src = by_name.get(mic)
     if src is None or not is_real_mic(src):
         return False, pin_mic, f"raw mic: {mic or '?'} is not a real mic"
-    return True, mic, f"echo-cancelled {mic} (+ raw backup)"
+    return True, pin_mic, f"raw mic + echo-cancelled {mic}"
 
 
 def mic_source_setting(value):
-    """Normalise `[audio] mic_source`: 'auto' (blank too), 'raw', or a
-    PipeWire node.name kept verbatim."""
+    """Normalise `[audio] mic_source`: 'raw' (the default; blank too),
+    'auto' (opt in to the echo-cancelled extra track), or a PipeWire
+    node.name kept verbatim."""
     value = (value or "").strip()
-    if value.lower() in ("", "auto"):
-        return "auto"
-    return "raw" if value.lower() == "raw" else value
+    if value.lower() in ("", "raw"):
+        return "raw"
+    return "auto" if value.lower() == "auto" else value
 
 
-# Mic track choice (pick_mic_track). The AEC track must PROVE itself;
-# anything doubtful records/uses the raw mic.
-PROFILE_WINDOW = 1.0      # s per peak window
-SILENT_PEAK = 2           # window peak (of 32767) <= this: digital silence
-RAW_SIGNAL_PEAK = 100     # window peak above this: the raw mic has signal
-AEC_GAP_TOLERANCE = 0.5   # s the AEC track may fall short of expectation
-AEC_MAX_LEAD = 15.0       # s; a longer head start than this is implausible
-AEC_SILENT_RUN = 10       # windows: AEC silent this long ...
-AEC_SILENT_RUN_SIGNAL = 5  # ... while raw has signal in this many -> raw
+# Mic track choice (pick_mic_track). The raw mic is the primary track; the
+# echo-cancelled one is an optional extra that must PROVE itself. Anything
+# doubtful uses the raw mic.
+PROFILE_WINDOW = 1.0      # s per profile window (peak + RMS)
+AEC_GAP_TOLERANCE = 0.5   # s the AEC length may differ from expectation
+AEC_MAX_DELAY = AEC_BUDGET + 2.0   # s; a later AEC start is implausible
+VOICE_WINDOW = 10         # profile windows per voice-check window (10 s)
+RAW_SPEECH_RMS = 250      # 1 s RMS (of 32767) on the raw mic: speech level
+SYS_QUIET_RMS = 100       # 1 s RMS on sys.wav below this: far side quiet
+AEC_SILENT_RMS = 30       # AEC RMS below this is near-silent ...
+AEC_SILENT_RATIO = 0.1    # ... and so is anything 20 dB under the raw mic
+AEC_LOST_FRACTION = 0.2   # > this share of raw speech windows lost -> raw
 
 
-def silent_stretch(aec_peaks, raw_peaks, offset=0):
-    """True if some AEC_SILENT_RUN consecutive windows are digital silence
-    on the AEC track while the raw track has signal in at least
-    AEC_SILENT_RUN_SIGNAL of them. aec window i+offset lines up with raw
-    window i (the AEC track starts earlier). A stretch where both are
-    quiet is not evidence (nobody spoke). A recording shorter than
-    AEC_SILENT_RUN windows is judged whole: AEC silent throughout while
-    raw has signal in at least half of it."""
-    need = min(AEC_SILENT_RUN, len(raw_peaks))
-    sig_need = max(1, min(AEC_SILENT_RUN_SIGNAL, (need + 1) // 2))
-    run = []                   # raw-signal flags of the current AEC-silent run
-    for i, rp in enumerate(raw_peaks):
-        j = i + offset
-        ap = aec_peaks[j] if 0 <= j < len(aec_peaks) else None
-        if ap is None or ap > SILENT_PEAK:
-            run = []
+def _rms(values):
+    return math.sqrt(sum(v * v for v in values) / len(values)) if values else 0.0
+
+
+def aec_voice_error(aec_rms, raw_rms, sys_rms=None, offset=0):
+    """Why the echo-cancelled track must not be used (None if it may).
+
+    Per-second RMS lists (wav_profile); AEC second i - offset lines up
+    with raw/sys second i (the AEC recorder starts `offset` s later; the
+    seconds before it are spliced from the raw track anyway).
+    - Wholly near-silent AEC while the raw mic has speech-level signal
+      anywhere -> raw.
+    - Per VOICE_WINDOW-second window: the seconds where the raw mic is at
+      speech level and the far side (sys.wav) is quiet are the user's own
+      voice (with the far side talking, raw may just be echo that AEC is
+      right to remove). The window is "lost" if AEC over those seconds is
+      near-silent (< AEC_SILENT_RMS or 20 dB under raw). More than
+      AEC_LOST_FRACTION of such windows lost -> raw.
+    """
+    speech = [i for i, r in enumerate(raw_rms)
+              if i >= offset and r >= RAW_SPEECH_RMS]
+    if not speech:
+        return None                     # the mic never heard the user
+    aec_at = (lambda i: aec_rms[i - offset]
+              if 0 <= i - offset < len(aec_rms) else 0.0)
+    if max(aec_rms or [0.0]) < AEC_SILENT_RMS:
+        return "echo-cancelled track silent while the mic was not"
+    windows = lost = 0
+    for w in range(0, len(raw_rms), VOICE_WINDOW):
+        own = [i for i in speech if w <= i < w + VOICE_WINDOW
+               and (sys_rms is None or i >= len(sys_rms)
+                    or sys_rms[i] < SYS_QUIET_RMS)]
+        if not own:
             continue
-        run.append(rp > RAW_SIGNAL_PEAK)
-        if len(run) >= need and sum(run[-need:]) >= sig_need:
-            return True
-    return False
+        windows += 1
+        raw_level = _rms([raw_rms[i] for i in own])
+        aec_level = _rms([aec_at(i) for i in own])
+        if aec_level < max(AEC_SILENT_RMS, raw_level * AEC_SILENT_RATIO):
+            lost += 1
+    if windows and lost > AEC_LOST_FRACTION * windows:
+        return (f"echo-cancelled track lost your voice in {lost} of "
+                f"{windows} speech windows")
+    return None
 
 
-def pick_mic_track(aec, raw, lead=0.0):
-    """Choose the mic track of a session recorded with echo cancellation.
+def pick_mic_track(aec, raw, delay=0.0, sys=None):
+    """Choose the mic track of a session that also recorded echo
+    cancellation.
 
-    aec / raw: wav_profile() of the echo-cancelled / raw-mic WAV, or None
-    (missing, empty, unreadable). lead: seconds the AEC recorder was
-    linked before the raw/speaker recorders started (session.json
-    `aec_lead`; all recorders are stopped together, so a complete AEC
-    track is raw + lead long).
-    Returns (choice, trim, reason): choice 'aec' or 'raw'; trim = seconds
-    to cut from the start of the AEC track so it lines up with sys.wav.
-    'aec' only if all of:
-      - both tracks are readable 16-bit (peaks known);
-      - no capture gap: the AEC track is at most AEC_GAP_TOLERANCE short
-        of raw + lead, and its head start is <= AEC_MAX_LEAD;
-      - no sustained silence: silent_stretch() is False.
-    With no raw track the AEC one is all there is ('aec').
+    aec / raw / sys: wav_profile() of the echo-cancelled, raw-mic and
+    speaker WAVs, or None (missing, empty, unreadable). delay: seconds
+    after the raw/speaker recorders the AEC recorder was linked
+    (session.json `aec_delay`; all recorders are stopped together, so a
+    complete AEC track is raw - delay long).
+    Returns (choice, offset, reason): choice 'aec' or 'raw'; offset =
+    seconds of raw mic to put before the AEC track so it lines up with
+    sys.wav (splice_mic). 'aec' only if all of:
+      - both tracks are readable 16-bit (levels known);
+      - their lengths agree with the delay within AEC_GAP_TOLERANCE (no
+        gap in AEC, no unexplained extra) and the delay is plausible;
+      - aec_voice_error() finds no lost voice.
     """
     if aec is None:
         return "raw", 0.0, "echo-cancelled track missing or empty"
     if raw is None:
-        return "aec", 0.0, "raw track missing; echo-cancelled track only"
-    if aec.get("peaks") is None or raw.get("peaks") is None:
+        return "raw", 0.0, "raw track missing; nothing to align with"
+    if aec.get("rms") is None or raw.get("rms") is None:
         return "raw", 0.0, "cannot analyse the tracks (not 16-bit)"
-    lead = max(0.0, float(lead or 0.0))
-    actual = aec["seconds"] - raw["seconds"]
-    if actual > AEC_MAX_LEAD:
-        return "raw", 0.0, f"echo-cancelled track {actual:.1f}s too long"
-    short = lead - actual
-    if short > AEC_GAP_TOLERANCE:
-        return "raw", 0.0, f"echo-cancelled track has a {short:.1f}s gap"
-    # Lengths agree (|short| <= tolerance): the measured head start is the
-    # exact alignment. AEC longer than expected = the RAW track lost time;
-    # then the recorded lead is the better estimate.
-    trim = max(0.0, actual) if short >= -AEC_GAP_TOLERANCE else lead
-    if silent_stretch(aec["peaks"], raw["peaks"],
-                      int(round(trim / PROFILE_WINDOW))):
-        return "raw", 0.0, "echo-cancelled track silent while the mic was not"
-    return "aec", trim, "echo-cancelled track complete"
+    delay = max(0.0, float(delay or 0.0))
+    actual = raw["seconds"] - aec["seconds"]
+    if actual > AEC_MAX_DELAY:
+        return "raw", 0.0, f"echo-cancelled track started {actual:.1f}s late"
+    if actual - delay > AEC_GAP_TOLERANCE:
+        return "raw", 0.0, (f"echo-cancelled track has a "
+                            f"{actual - delay:.1f}s gap")
+    if delay - actual > AEC_GAP_TOLERANCE:
+        return "raw", 0.0, (f"echo-cancelled track {delay - actual:.1f}s "
+                            "longer than expected")
+    offset = max(0.0, actual)
+    why = aec_voice_error(aec["rms"], raw["rms"],
+                          (sys or {}).get("rms"),
+                          int(round(offset / PROFILE_WINDOW)))
+    if why:
+        return "raw", 0.0, why
+    return "aec", offset, "echo-cancelled track complete"
+
+
+def aec_route_error(aec_mic, follows_default, default_sink, default_source,
+                    sink_inputs, sinks, source_outputs, sources, apps):
+    """Why the echo-cancelled track no longer matches the call (None if
+    it does). Pure.
+
+    The canceller's capture is pinned to aec_mic (module-echo-cancel sets
+    node.link-group, so WirePlumber never moves it with the default) and
+    its reference follows the default sink. So AEC is wrong as soon as
+    the call app plays to a non-default sink, or its mic is not aec_mic.
+    With no call stream to look at, the mic is checked against the
+    default only if aec_mic was the default at start (follows_default).
+    Unreadable defaults count as divergence (unprovable -> raw).
+    """
+    if not default_sink or not default_source:
+        return "cannot read the default devices"
+    pin_sink = app_device(sink_inputs, sinks, apps, "sink", default_sink)
+    if pin_sink:
+        return f"call app now plays to {pin_sink}, not the default sink"
+    if call_streams(source_outputs, apps):
+        mic = app_device(source_outputs, sources, apps, "source",
+                         default_source) or default_source
+    elif follows_default:
+        mic = default_source
+    else:
+        return None
+    if mic != aec_mic:
+        return f"call mic is now {mic}; the echo canceller captured {aec_mic}"
+    return None
 
 
 def whisper_options(cfg):
@@ -770,10 +842,10 @@ def cell_diffs(a, b, grid=None):
 def screen_params(cfg):
     """[screens] settings as numbers; a bad value falls back to the default."""
     out = {}
-    for key, conv in (("interval_seconds", float), ("change_threshold", float),
+    for key, conv in (("interval_seconds", float), ("min_width", float),
                       ("stable_threshold", float), ("settle_ticks", int),
                       ("cell_change_threshold", float),
-                      ("change_fraction", float), ("volatile_ticks", int),
+                      ("region_fraction", float), ("volatile_ticks", int),
                       ("volatile_window", int), ("max_volatile", float),
                       ("burst_fraction", float), ("transition_ticks", int),
                       ("min_gap_seconds", float), ("max_frames", int),
@@ -807,6 +879,54 @@ SCREEN_BURST_QUIET = 2
 
 SCREEN_KEEP_START = {"hist": (), "vol": (), "last": (), "ex": (),
                      "stable": 0, "kept": 0, "last_keep": None}
+
+
+def grid_cols(n):
+    """Columns of the row-major cell grid cell_diffs returns n cells for."""
+    return SCREEN_GRID if n % SCREEN_GRID == 0 else n
+
+
+# Changed cells this close (Chebyshev distance, in cells) are one region:
+# 2 = a one-cell gap is bridged, so a slide's text block (lines separated
+# by blank rows) counts as one region; isolated speaking rings/labels in
+# separate tiles stay apart.
+SCREEN_REGION_REACH = 2
+
+
+def largest_region(cells, n, cols=None, reach=SCREEN_REGION_REACH):
+    """Number of cells in the largest group among `cells` (indices into a
+    row-major grid of n cells, `cols` wide) where cells within `reach`
+    (Chebyshev distance) of each other are connected. Pure."""
+    cols = cols or grid_cols(n)
+    span = range(-reach, reach + 1)
+    todo, best = set(cells), 0
+    while todo:
+        stack, size = [todo.pop()], 0
+        while stack:
+            i = stack.pop()
+            size += 1
+            r, c = divmod(i, cols)
+            for dr in span:
+                for dc in span:
+                    rr, cc = r + dr, c + dc
+                    j = rr * cols + cc
+                    if 0 <= cc < cols and 0 <= j < n and j in todo:
+                        todo.remove(j)
+                        stack.append(j)
+        best = max(best, size)
+    return best
+
+
+def region_is_new(d_kept, calm, p):
+    """True if the calm cells that differ from the last kept frame by more
+    than cell_change_threshold include one connected region covering at
+    least region_fraction of ALL cells (fix round 8). Measured on today's
+    real calls (.work/frame-stats.txt, kept-frame pairs): Teams gallery
+    churn changes <= 20 % of the cells with the largest connected region
+    <= 18 %; shares and slide changes are mostly one block of 25-95 %."""
+    n = len(d_kept)
+    changed = [i for i in calm if d_kept[i] > p["cell_change_threshold"]]
+    return largest_region(changed, n) >= p["region_fraction"] * n
 
 
 def screen_keep_step(state, d_prev, d_kept, t, p):
@@ -844,9 +964,11 @@ def screen_keep_step(state, d_prev, d_kept, t, p):
     unchanged.
     Volatile cells are ignored for both decisions:
       settled = no calm cell moved, for settle_ticks ticks in a row;
-      new     = >= change_fraction of the calm cells differ from the kept
-                frame by > cell_change_threshold, or the calm cells' mean
-                difference is >= change_threshold.
+      new     = region_is_new(): ONE connected region of calm cells that
+                differ from the kept frame by > cell_change_threshold
+                covers >= region_fraction of the window (fix round 8:
+                speaking rings, tile reflow and name labels are small and
+                scattered; a shared slide/doc/screen is one large block).
     More than max_volatile of the cells volatile (full-window video,
     gallery view) keeps nothing. Then min_gap_seconds / max_frames apply.
     """
@@ -881,10 +1003,7 @@ def screen_keep_step(state, d_prev, d_kept, t, p):
     if d_kept is None or len(d_kept) != n:
         new = True
     else:
-        diffs = [d_kept[i] for i in calm]
-        differ = sum(1 for x in diffs if x > p["cell_change_threshold"])
-        new = (differ >= p["change_fraction"] * len(diffs)
-               or sum(diffs) / len(diffs) >= p["change_threshold"])
+        new = region_is_new(d_kept, calm, p)
     gap_ok = (state["last_keep"] is None
               or t - state["last_keep"] >= p["min_gap_seconds"])
     keep = (new and stable >= p["settle_ticks"] and gap_ok
@@ -892,6 +1011,20 @@ def screen_keep_step(state, d_prev, d_kept, t, p):
     if keep:
         out.update(kept=state["kept"] + 1, last_keep=t)
     return out, keep
+
+
+def screen_width(win):
+    """Logical width of a hyprctl client (0 if unknown)."""
+    try:
+        return float((win.get("size") or [0])[0])
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+
+
+def screen_too_narrow(win, p):
+    """True if the window is narrower than [screens] min_width: in a
+    narrow tile (338-598 px in a real call) a share is unreadable."""
+    return screen_width(win) < p["min_width"]
 
 
 def screen_file_name(offset):
@@ -1274,10 +1407,11 @@ def notify(title, body=""):
 # Environment probes (PipeWire / Hyprland)
 # --------------------------------------------------------------------------- #
 
-def run_json(argv, default, env=None):
+def run_json(argv, default, env=None, timeout=5.0):
     try:
-        out = subprocess.run(argv, capture_output=True, text=True, timeout=5,
-                             env=env, stdin=subprocess.DEVNULL)
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             timeout=timeout, env=env,
+                             stdin=subprocess.DEVNULL)
         return json.loads(out.stdout) if out.returncode == 0 else default
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return default
@@ -1496,35 +1630,40 @@ def start_settings(cfg):
     return {"rate": rate, "apps": auto_apps(cfg),
             "screens": screens_enabled(cfg),
             "mic_source": mic_source_setting(
-                cfg.get("audio", "mic_source", raw=True, fallback="auto"))}
+                cfg.get("audio", "mic_source", raw=True, fallback="raw"))}
 
 
-def pactl_default(kind):
+def pactl_default(kind, timeout=5):
     """`pactl get-default-<kind>`, bounded (it runs under the lifecycle
     lock: a hung pactl must not block every other transition)."""
     return subprocess.check_output(["pactl", f"get-default-{kind}"], text=True,
-                                   timeout=5,
+                                   timeout=timeout,
                                    stdin=subprocess.DEVNULL).strip()
 
 
-def wait_aec_graph(names, want, timeout, procs):
-    """Poll pw-dump until aec_graph_state() is in `want`; returns the last
-    state. Stops early on 'unsafe' or when one of procs (Popen) exited."""
-    deadline = time.monotonic() + timeout
+def wait_aec_graph(names, want, deadline, procs):
+    """Poll pw-dump until aec_graph_state() is in `want` or the monotonic
+    deadline passed; returns the last state. Each pw-dump is bounded by
+    the time left, so the deadline really is the limit. Stops early on
+    'unsafe' or when one of procs (Popen) exited."""
     st = "missing"
     while True:
-        st = aec_graph_state(run_json(["pw-dump"], []), names)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return st
+        st = aec_graph_state(run_json(["pw-dump"], [],
+                                      timeout=max(0.1, left)), names)
         if st in want or st == "unsafe":
             return st
         if any(p.poll() is not None for p in procs):
             return "exited"
-        if time.monotonic() >= deadline:
-            return st
-        time.sleep(0.15)
+        time.sleep(min(0.15, max(0.0, deadline - time.monotonic())))
 
 
-def start_aec(sess_dir, names, mic, base, wav, quiet, procs, helpers):
-    """Start the per-recording echo canceller and its recorder.
+def start_aec(sess_dir, names, mic, base, wav, quiet, procs, helpers,
+              budget=AEC_BUDGET):
+    """Start the per-recording echo canceller and its recorder -- an
+    optional extra track, started AFTER the primary recorders.
 
     Runs `pipewire -c <sess_dir>/aec.conf` (a separate PipeWire client
     process: nothing is loaded into the daemon, a crash or a missing
@@ -1532,13 +1671,15 @@ def start_aec(sess_dir, names, mic, base, wav, quiet, procs, helpers):
     node, then starts pw-record on it (target.object = that node,
     node.dont-fallback: if it vanishes the recorder is destroyed rather
     than silently falling back to the default mic) and waits until
-    WirePlumber linked it. Spawned processes are appended to procs /
-    helpers at once (the caller's rollback stops them).
-    Returns the monotonic time the link was seen, or None: AEC is not
-    used and everything this started is stopped again. Never raises an
-    Exception (only BaseException, for the caller's rollback).
+    WirePlumber linked it. All of that within `budget` seconds. Spawned
+    processes are appended to procs / helpers at once (the caller's
+    rollback stops them).
+    Returns (monotonic time the link was seen, None) or (None, why): on
+    failure everything this started is stopped again and its WAV removed.
+    Never raises an Exception (only BaseException, for the rollback).
     """
     helper = rec = None
+    deadline = time.monotonic() + budget
     try:
         conf = os.path.join(sess_dir, "aec.conf")
         fd = os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1551,7 +1692,7 @@ def start_aec(sess_dir, names, mic, base, wav, quiet, procs, helpers):
                                  env=aec_env())
         helper = (p.pid, proc_start(p.pid))
         helpers.append(helper)
-        st = wait_aec_graph(names, {"ready", "linked"}, AEC_NODE_WAIT, [p])
+        st = wait_aec_graph(names, {"ready", "linked"}, deadline, [p])
         if st not in ("ready", "linked"):
             raise RuntimeError(f"echo canceller {st}")
         r = subprocess.Popen(
@@ -1560,23 +1701,27 @@ def start_aec(sess_dir, names, mic, base, wav, quiet, procs, helpers):
                     "--target", names["mic"], wav], **quiet)
         rec = (r.pid, proc_start(r.pid))
         procs.append(rec)
-        st = wait_aec_graph(names, {"linked"}, AEC_LINK_WAIT, [p, r])
+        st = wait_aec_graph(names, {"linked"}, deadline, [p, r])
         if st != "linked":
             raise RuntimeError(f"echo-cancelled recorder {st}")
-        return time.monotonic()
+        return time.monotonic(), None
     except Exception as e:
         print(f"echo cancellation not used: {e}", file=sys.stderr)
         if rec:
             stop_procs([rec], timeout=1)
             procs.remove(rec)
         if helper:
-            stop_helpers([helper])
+            stop_helpers([helper], timeout=1)
             helpers.remove(helper)
         try:
             os.remove(wav)
         except OSError:
             pass
-        return None
+        return None, str(e)
+
+
+class StartFailed(RuntimeError):
+    """No primary recorder came up: transient for the watcher (RETRY)."""
 
 
 def start_locked(cfg, source, stale=None):
@@ -1584,7 +1729,13 @@ def start_locked(cfg, source, stale=None):
     once, complete (recorders verified, screens worker attached), so no
     other start/stop/watcher can see or clobber a half-made session.
     A crashed previous session is stopped and cleared here and appended to
-    `stale` for the caller to finalize after releasing the lock."""
+    `stale` for the caller to finalize after releasing the lock.
+
+    Order (fix round 8): speaker + raw mic recorders start first, exactly
+    as before echo cancellation existed; the optional AEC track is set up
+    after them within AEC_BUDGET and its failure only means "no AEC
+    track". Whatever primary recorder is alive is kept; only when neither
+    came up does start fail, with RETRY (the watcher tries again)."""
     state = read_state()
     if state is not None:
         if session_live(state):
@@ -1633,12 +1784,13 @@ def start_locked(cfg, source, stale=None):
     pin_mic = app_device(
         run_json(["pactl", "-f", "json", "list", "source-outputs"], []),
         sources, apps, "source", mic)
-    # Mic: with echo cancellation (auto, call app on the default sink, a
-    # real mic) the far side played through speakers is removed from the
-    # "Me" track; the raw mic is recorded too, from that real mic node.
+    # Mic: the raw recorder is always the pre-AEC one. With `auto` (call
+    # app on the default sink, a real mic) an echo-cancelled extra track
+    # of that mic is recorded too; finalize uses it only if it proves good.
     use_aec, mic_target, mic_note = plan_mic(
         settings["mic_source"], sources, pin_mic or mic, pin_sink, pin_mic)
     print(f"mic: {mic_note}", file=sys.stderr)
+    aec_mic = pin_mic or mic
     sink, mic = pin_sink or sink, pin_mic or mic
     title = meeting_title(cfg)
 
@@ -1652,54 +1804,57 @@ def start_locked(cfg, source, stale=None):
         return 1
     sys_wav = os.path.join(sess_dir, "sys.wav")
     mic_wav = os.path.join(sess_dir, "mic.wav")
-    mic_raw_wav = os.path.join(sess_dir, "mic-raw.wav")
+    aec_wav = os.path.join(sess_dir, "mic-aec.wav")
     base = ["pw-record", "--channels", "1", "--rate", rate]
     procs, helpers, worker = [], [], None
     # Everything from the first spawn to the published state is one unit:
     # any failure (or exception) stops what was spawned and removes the raw
     # dir, so nothing runs untracked by session.json.
     try:
-        # The AEC recorder starts (and is linked) BEFORE the others, so a
-        # complete AEC track is longer than the raw one by exactly the
-        # recorded lead; finalize trims that and treats a shortfall as a gap.
-        linked = None
-        if use_aec:
-            linked = start_aec(sess_dir, aec_names(session_id), mic, base,
-                               mic_wav, quiet, procs, helpers)
-        echo = linked is not None
-        raw_wav = mic_raw_wav if echo else mic_wav
-        # AEC planned but unavailable -> exactly the old raw behaviour.
-        raw_target = pin_mic if use_aec and not echo else mic_target
-        if use_aec and not echo:
-            mic_note = "raw mic: echo canceller unavailable"
         argvs = [base + ["-P", "{ stream.capture.sink = true }"]
                  + (["--target", pin_sink] if pin_sink else []) + [sys_wav],
-                 base + (["--target", raw_target] if raw_target else [])
-                 + [raw_wav]]
+                 base + (["--target", mic_target] if mic_target else [])
+                 + [mic_wav]]
         # Taken immediately before audio starts (after all the slow probes):
         # wall time names the folder, the monotonic origin times the frames.
         start_unix, origin = int(time.time()), time.monotonic()
         children = []
         for argv in argvs:
             p = subprocess.Popen(argv, **quiet)
-            children.append(p)
-            procs.append((p.pid, proc_start(p.pid)))
+            children.append((p, (p.pid, proc_start(p.pid))))
+            procs.append(children[-1][1])
         time.sleep(0.4)
-        # The speaker side plus the raw mic recorder must be up (the AEC
-        # one is optional: finalize then uses the raw track).
-        if any(p.poll() is not None for p in children):
-            raise RuntimeError("pw-record failed to open the speaker or "
-                               "microphone.")
+        dead = [i for i, (p, _) in enumerate(children) if p.poll() is not None]
+        if len(dead) == len(children):
+            raise StartFailed("pw-record failed to open the speaker and the "
+                              "microphone.")
+        for i in dead:              # keep whatever primary track we have
+            procs.remove(children[i][1])
+        lost = " and ".join(("speaker", "microphone")[i] for i in dead)
+        if lost:
+            print(f"pw-record failed to open the {lost}; recording the "
+                  "rest", file=sys.stderr)
+        linked = None
+        if use_aec and 1 not in dead:
+            linked, why = start_aec(sess_dir, aec_names(session_id), aec_mic,
+                                    base, aec_wav, quiet, procs, helpers)
+            if linked is None:
+                mic_note = f"raw mic (echo canceller not used: {why})"
+        echo = linked is not None
         state = {"id": session_id, "pids": [p for p, _ in procs],
                  "pid_starts": {str(p): s for p, s in procs},
                  "start": start_unix, "origin": origin,
                  "session_dir": sess_dir, "sys_wav": sys_wav,
                  "mic_wav": mic_wav, "source": source, "title": title,
-                 "sink": sink, "mic": mic, "mic_source": raw_target,
+                 "sink": sink, "mic": mic, "mic_source": mic_target,
                  "mic_note": mic_note, "mic_echo_cancel": echo}
+        if lost:
+            state["start_note"] = f"{lost} recorder failed to start"
         if echo:
-            state["mic_raw_wav"] = mic_raw_wav
-            state["aec_lead"] = round(max(0.0, origin - linked), 3)
+            state["mic_aec_wav"] = aec_wav
+            state["aec_delay"] = round(max(0.0, linked - origin), 3)
+            state["aec_mic"] = aec_mic
+            state["aec_follows_default"] = not pin_mic
         if helpers:
             state["aec_pid"], state["aec_start"] = helpers[0]
         if settings["screens"]:
@@ -1712,11 +1867,14 @@ def start_locked(cfg, source, stale=None):
         shutil.rmtree(sess_dir, ignore_errors=True)
         if not isinstance(e, Exception):
             raise
-        notify("Meeting recorder: could not start", str(e))
+        retry = isinstance(e, StartFailed)
+        if not (retry and source == "teams"):   # the watcher notifies then
+            notify("Meeting recorder: could not start", str(e))
         print(f"failed to start: {e}", file=sys.stderr)
-        return 1
+        return RETRY if retry else 1
     notify("● Recording started",
            (title or ("Teams call" if source == "teams" else "Manual recording"))
+           + (f"\n⚠ {state['start_note']}" if lost else "")
            + "\nStop: click the mic icon in the bar, or Super+Shift+R")
     print("recording")
     return 0
@@ -1795,10 +1953,19 @@ def write_transcripts(folder, segments, start_unix, duration, title="",
     return None
 
 
+def _sumsq(a):
+    """Sum of squares of an int array at C speed where available."""
+    try:
+        return math.sumprod(a, a)
+    except AttributeError:                       # Python < 3.12
+        return sum(x * x for x in a)
+
+
 def wav_profile(path, window=PROFILE_WINDOW):
-    """{'seconds', 'peaks'} of a WAV, or None if missing/tiny/unreadable.
-    peaks: max |sample| per `window` seconds (16-bit audio only, else
-    None). Reads in window-sized chunks (an hour of 16 kHz mono ~115 MB)."""
+    """{'seconds', 'peaks', 'rms'} of a WAV, or None if missing/tiny/
+    unreadable. peaks / rms: max |sample| and RMS per `window` seconds
+    (16-bit audio only, else None). Reads in window-sized chunks (an hour
+    of 16 kHz mono ~115 MB)."""
     import array
     import wave
     try:
@@ -1808,6 +1975,7 @@ def wav_profile(path, window=PROFILE_WINDOW):
             rate, width = w.getframerate(), w.getsampwidth()
             frames = w.getnframes()
             peaks = [] if width == 2 else None
+            rms = [] if width == 2 else None
             step = max(1, int(rate * window))
             while peaks is not None:
                 chunk = w.readframes(step)
@@ -1819,11 +1987,12 @@ def wav_profile(path, window=PROFILE_WINDOW):
                     a.byteswap()
                 if a:
                     peaks.append(max(max(a), -min(a)))
+                    rms.append(math.sqrt(_sumsq(a) / len(a)))
     except (OSError, EOFError, wave.Error):
         return None
     if not frames or not rate:
         return None
-    return {"seconds": frames / rate, "peaks": peaks}
+    return {"seconds": frames / rate, "peaks": peaks, "rms": rms}
 
 
 def wav_stats(path):
@@ -1836,23 +2005,68 @@ def wav_stats(path):
             "peak": None if peaks is None else max(peaks, default=0)}
 
 
+def splice_mic(raw_path, aec_path, offset, out_path):
+    """Write out_path = the first `offset` s of the raw mic + the whole
+    echo-cancelled track, so the result lines up with sys.wav (the AEC
+    recorder starts after the primaries). Both WAVs must have the same
+    format (ValueError otherwise). Returns out_path."""
+    import wave
+    with wave.open(raw_path, "rb") as raw, wave.open(aec_path, "rb") as aec:
+        fmt = (raw.getnchannels(), raw.getsampwidth(), raw.getframerate())
+        if fmt != (aec.getnchannels(), aec.getsampwidth(),
+                   aec.getframerate()):
+            raise ValueError("raw and echo-cancelled WAV formats differ")
+        with wave.open(out_path, "wb") as out:
+            out.setnchannels(fmt[0])
+            out.setsampwidth(fmt[1])
+            out.setframerate(fmt[2])
+            out.writeframes(raw.readframes(int(round(offset * fmt[2]))))
+            while True:
+                chunk = aec.readframes(1 << 16)
+                if not chunk:
+                    break
+                out.writeframes(chunk)
+    return out_path
+
+
+def aligned_aec_path(state):
+    return os.path.join(state.get("session_dir") or os.path.dirname(
+        state["mic_wav"]), "mic-aec-aligned.wav")
+
+
 def mic_choice(state):
-    """(mic WAV, trim seconds, echo_cancel, reason) for a stopped session.
-    Sessions recorded with AEC also have the raw mic (pick_mic_track)."""
-    mic_wav, raw = state["mic_wav"], state.get("mic_raw_wav")
-    if not (state.get("mic_echo_cancel") and raw):
-        return mic_wav, 0.0, False, ""
-    choice, trim, reason = pick_mic_track(
-        wav_profile(mic_wav), wav_profile(raw), state.get("aec_lead", 0.0))
+    """(mic WAV, echo_cancel, reason) for a stopped session.
+
+    The raw mic (state mic_wav) is the primary track. A session that also
+    recorded the echo-cancelled extra (mic_aec_wav) uses it only if the
+    call's routes never diverged from it (aec_diverged) and
+    pick_mic_track proves it complete; it is then spliced behind the raw
+    head (splice_mic). Sessions written by fix round 7 (AEC in mic_wav,
+    raw in mic_raw_wav) use their raw track."""
+    mic_wav = state["mic_wav"]
+    if state.get("mic_raw_wav"):
+        return state["mic_raw_wav"], False, "older session layout: raw mic"
+    aec = state.get("mic_aec_wav")
+    if not (state.get("mic_echo_cancel") and aec):
+        return mic_wav, False, ""
+    if state.get("aec_diverged"):
+        return mic_wav, False, f"route changed: {state['aec_diverged']}"
+    choice, offset, reason = pick_mic_track(
+        wav_profile(aec), wav_profile(mic_wav), state.get("aec_delay", 0.0),
+        wav_profile(state.get("sys_wav") or ""))
     print(f"mic track: {choice} ({reason})", file=sys.stderr)
     if choice == "raw":
-        return raw, 0.0, False, reason
-    return mic_wav, trim, True, reason
+        return mic_wav, False, reason
+    try:
+        return (splice_mic(mic_wav, aec, offset, aligned_aec_path(state)),
+                True, reason)
+    except (OSError, EOFError, ValueError, __import__("wave").Error) as e:
+        return mic_wav, False, f"cannot align the echo-cancelled track: {e}"
 
 
 def choose_mic_wav(state):
     """(mic WAV to use, echo_cancel); see mic_choice."""
-    wav, _, echo, _ = mic_choice(state)
+    wav, echo, _ = mic_choice(state)
     return wav, echo
 
 
@@ -1875,62 +2089,59 @@ def encoded_ok(path, expect_seconds):
     return got is not None and got >= expect_seconds * 0.95 - 1.0
 
 
-def encode_session(folder, sys_wav, mic_wav, trim, cfg, verify):
-    """Encode meeting.m4a, me.m4a, others.m4a into folder; returns the
-    tracks used. trim: seconds cut from the start of mic_wav (the AEC
-    recorder's head start). verify: meeting.m4a and me.m4a must decode
-    at full length, else RuntimeError (the caller falls back to raw)."""
+class Unverified(RuntimeError):
+    """An encoded output is missing or shorter than its input WAV."""
+
+
+def encode_session(folder, sys_wav, mic_wav, cfg):
+    """Encode meeting.m4a, me.m4a, others.m4a into folder and verify each
+    decodes at (nearly) full length; returns the tracks used. Raises
+    Unverified when one does not (the WAVs must then be kept), or
+    CalledProcessError when the mix itself fails."""
     have = [w for w in (sys_wav, mic_wav)
             if os.path.exists(w) and os.path.getsize(w) > 1024]
     if not have:
         raise RuntimeError("no audio was captured")
     final_m4a = os.path.join(folder, "meeting.m4a")
-    mic_in = (["-ss", f"{trim:.3f}"] if trim > 0 else []) + ["-i", mic_wav]
     if len(have) == 2:
         cmd = build_ffmpeg_mix_cmd(
             sys_wav, mic_wav, final_m4a,
             cfg.getfloat("audio", "sys_volume"),
             cfg.getfloat("audio", "mic_volume"),
             cfg.getint("audio", "sample_rate"))
-        i = cmd.index(mic_wav)
-        cmd[i - 1:i + 1] = mic_in
     else:  # one track is missing/empty: keep what we have
-        src = mic_in if have[0] == mic_wav else ["-i", have[0]]
-        cmd = ["ffmpeg", "-y"] + src + ["-c:a", "aac", "-b:a", "96k",
-                                       final_m4a]
+        cmd = ["ffmpeg", "-y", "-i", have[0], "-c:a", "aac", "-b:a", "96k",
+               final_m4a]
     quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                  stderr=subprocess.DEVNULL)
     subprocess.run(cmd, check=True, **quiet)
-    secs = {}
-    if verify:
-        for w in have:
-            secs[w] = (wav_stats(w) or {}).get("seconds", 0.0)
-        if mic_wav in secs:
-            secs[mic_wav] = max(0.0, secs[mic_wav] - trim)
-        if not encoded_ok(final_m4a, max(secs.values())):
-            raise RuntimeError("meeting.m4a did not verify")
+    secs = {w: (wav_stats(w) or {}).get("seconds", 0.0) for w in have}
+    if not encoded_ok(final_m4a, max(secs.values())):
+        raise Unverified("meeting.m4a did not verify")
     # Keep each side as its own small file so the transcript can say who spoke.
     for wav, name in ((mic_wav, "me.m4a"), (sys_wav, "others.m4a")):
         if wav in have:
-            src = mic_in if wav == mic_wav else ["-i", wav]
             out = os.path.join(folder, name)
-            subprocess.run(["ffmpeg", "-y"] + src + ["-c:a", "aac", "-b:a",
+            subprocess.run(["ffmpeg", "-y", "-i", wav, "-c:a", "aac", "-b:a",
                             "48k", out], check=False, **quiet)
-            if verify and wav == mic_wav and not encoded_ok(out, secs[wav]):
-                raise RuntimeError("me.m4a did not verify")
+            if not encoded_ok(out, secs[wav]):
+                raise Unverified(f"{name} did not verify")
     return have
 
 
 def finalize_audio(state, cfg):
     """Mix the raw tracks into the output folder; returns the folder path.
-    No WAV is deleted before the outputs are encoded; the echo-cancelled
-    choice must also verify (full-length meeting.m4a and me.m4a), else
-    everything is encoded again from the raw mic."""
+    No WAV is deleted before the chosen outputs are encoded AND verified
+    (full-length meeting.m4a, me.m4a, others.m4a). An echo-cancelled
+    choice that fails is encoded again from the raw mic; a raw encode
+    that does not verify keeps every WAV in the staging dir (meta.json
+    `audio_unverified`) and still goes on to transcription."""
     sys_wav = state["sys_wav"]
-    mic_wav, trim, echo, reason = mic_choice(state)
+    mic_wav, echo, reason = mic_choice(state)
+    raw_mic = state.get("mic_raw_wav") or state["mic_wav"]
     start_unix = state["start"]
     if not any(os.path.exists(w) and os.path.getsize(w) > 1024
-               for w in (sys_wav, mic_wav)):
+               for w in (sys_wav, mic_wav, raw_mic)):
         raise RuntimeError("no audio was captured")
 
     source = state.get("source", "manual")
@@ -1941,33 +2152,45 @@ def finalize_audio(state, cfg):
     folder = os.path.join(out_base, day, session_dir_name(start_unix, slug))
     os.makedirs(folder, exist_ok=True)
 
-    raw = state.get("mic_raw_wav")
+    unverified = None
     try:
-        have = encode_session(folder, sys_wav, mic_wav, trim, cfg,
-                              verify=echo)
+        have = encode_session(folder, sys_wav, mic_wav, cfg)
     except (RuntimeError, subprocess.CalledProcessError) as e:
-        if not (echo and raw):
-            raise
-        print(f"echo-cancelled encode failed ({e}); using the raw mic",
-              file=sys.stderr)
-        mic_wav, echo = raw, False
-        reason = f"echo-cancelled encode failed: {e}"
-        have = encode_session(folder, sys_wav, mic_wav, 0.0, cfg,
-                              verify=False)
+        if not echo and not isinstance(e, Unverified):
+            raise                   # nothing encoded: every WAV stays
+        if echo:
+            print(f"echo-cancelled encode failed ({e}); using the raw mic",
+                  file=sys.stderr)
+            mic_wav, echo = raw_mic, False
+            reason = f"echo-cancelled encode failed: {e}"
+            try:
+                have = encode_session(folder, sys_wav, mic_wav, cfg)
+            except Unverified as e2:
+                unverified, have = str(e2), [
+                    w for w in (sys_wav, mic_wav) if os.path.exists(w)
+                    and os.path.getsize(w) > 1024]
+        else:
+            unverified, have = str(e), [
+                w for w in (sys_wav, mic_wav) if os.path.exists(w)
+                and os.path.getsize(w) > 1024]
 
-    # Raw WAVs are disposable once the mix succeeds. Nothing here reads
+    # Raw WAVs are disposable once the outputs verified. Nothing here reads
     # screen data: the raw dir (frames, manifest, log) belongs to the
     # separate collect-screens job, which also removes it, so no screen
     # problem can delay or fail the audio or the transcription. The AEC
     # helper's config/log go too (the collector keeps a dir with extras).
     sess = state.get("session_dir") or ""
-    extras = ([os.path.join(sess, "aec.conf"), os.path.join(sess, "aec.log")]
-              if sess else [])
-    for f in filter(None, {sys_wav, state["mic_wav"], raw, *extras}):
-        try:
-            os.remove(f)
-        except OSError:
-            pass
+    if unverified:
+        print(f"{unverified}: keeping the WAVs in {sess}", file=sys.stderr)
+    else:
+        extras = ([os.path.join(sess, n) for n in (
+            "aec.conf", "aec.log", "mic-aec-aligned.wav")] if sess else [])
+        for f in filter(None, {sys_wav, state["mic_wav"], raw_mic,
+                               state.get("mic_aec_wav"), *extras}):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     meta = {
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z",
@@ -1982,6 +2205,13 @@ def finalize_audio(state, cfg):
     }
     if state.get("mic_echo_cancel"):
         meta["mic_track_reason"] = reason
+    elif state.get("mic_note"):
+        meta["mic_note"] = state["mic_note"]
+    if state.get("start_note"):
+        meta["start_note"] = state["start_note"]
+    if unverified:
+        meta["audio_unverified"] = unverified
+        meta["wavs_kept_in"] = sess
     write_json(os.path.join(folder, "meta.json"), meta)
     return folder
 
@@ -2320,12 +2550,56 @@ def stop_locked(expect_id=None, expect_source=None):
                                       or state.get("source") != expect_source):
         print("Session changed; not stopping it.", file=sys.stderr)
         return None
+    if state.get("mic_echo_cancel") and not state.get("aec_diverged"):
+        try:                # route divergence -> the raw mic (mic_choice)
+            why = probe_aec_route(state, auto_apps(load_config()))
+        except Exception as e:
+            why = f"cannot check the routes: {e}"
+        if why:
+            state["aec_diverged"] = why
     # Never raises: a signalling problem (PID reuse, permissions) must not
     # cost the audio finalization.
     stop_procs(state_procs(state), screens_proc(state),
                helpers=[aec_proc(state)])
     clear_state()
     return state
+
+
+def probe_aec_route(state, apps, timeout=2.0):
+    """aec_route_error() for a session from pactl; every probe bounded
+    (this runs under the lifecycle lock at stop)."""
+    try:
+        sink = pactl_default("sink", timeout)
+        source = pactl_default("source", timeout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        sink = source = ""
+
+    def ls(what):
+        return run_json(["pactl", "-f", "json", "list", what], [],
+                        timeout=timeout)
+    return aec_route_error(state.get("aec_mic", ""),
+                           state.get("aec_follows_default", True),
+                           sink, source, ls("sink-inputs"), ls("sinks"),
+                           ls("source-outputs"), ls("sources"), apps)
+
+
+AEC_ROUTE_SECONDS = 10.0     # watcher: how often a live AEC session is checked
+
+
+def mark_aec_diverged(session_id, why):
+    """Record in session.json that the AEC track no longer matches the
+    call (re-checked under the lock: only the same session)."""
+    try:
+        with lifecycle_lock(timeout=5):
+            st = read_state()
+            if st and st.get("id") == session_id and not st.get(
+                    "aec_diverged"):
+                st["aec_diverged"] = why
+                write_state(st)
+                print(f"echo-cancelled track invalidated: {why}",
+                      file=sys.stderr)
+    except TimeoutError:
+        pass
 
 
 def cmd_stop(args=(), expect_id=None, expect_source=None):
@@ -2658,6 +2932,7 @@ def cmd_screens_loop(args=()):
 
     keep_state, prev, kept_thumb = dict(SCREEN_KEEP_START), None, None
     prev_sid, used, last_size = None, 0, 1_000_000
+    narrow_logged = False
     next_tick = time.monotonic()
     while not stop and not session_over():
         try:
@@ -2670,6 +2945,13 @@ def cmd_screens_loop(args=()):
             if win is None:
                 prev = None
                 log(f"no window of class {p['window_class']!r}")
+            elif screen_too_narrow(win, p):
+                # a narrow tile: a share in it is unreadable (fix round 8)
+                prev = None
+                if not narrow_logged:
+                    narrow_logged = True
+                    log(f"window {screen_width(win):g} px wide < min_width "
+                        f"{p['min_width']:g}: skipping frames while narrow")
             else:
                 sid = str(win["stableId"])
                 if sid != prev_sid:            # another window: no stale diff
@@ -2926,6 +3208,7 @@ def cmd_watch(args=()):
     gone_since = None      # when the call was last seen ending
     handled = False        # this call was already recorded (or declined)
     retries, first_try = 0, None   # transient start failures in this call
+    route_checked = 0.0    # last AEC route check (AEC_ROUTE_SECONDS)
     cfg_mtime = 0
     while True:
         try:
@@ -2949,6 +3232,16 @@ def cmd_watch(args=()):
             except TimeoutError:
                 pass
             state, live = read_state(), False
+        if (live and state.get("mic_echo_cancel")
+                and not state.get("aec_diverged")
+                and now - route_checked >= AEC_ROUTE_SECONDS):
+            route_checked = now
+            try:
+                why = probe_aec_route(state, auto_apps(cfg))
+            except Exception as e:
+                why = f"cannot check the routes: {e}"
+            if why:
+                mark_aec_diverged(state.get("id"), why)
 
         if in_call:
             gone_since = None

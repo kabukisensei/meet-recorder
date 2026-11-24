@@ -109,12 +109,15 @@ rmdir'd only when empty; dry-run is the default.
   recovery and start's rollback stop it AFTER the recorders
   (`stop_procs(helpers=…)` -> `stop_helpers`: SIGTERM, which quits its main
   loop, SIGKILL after 3 s; identity-checked like everything else).
-  Env scrubbed (`aec_env`): no `PIPEWIRE_CONFIG_NAME/PREFIX/DIR`
-  (would load another config), no `PIPEWIRE_AUTOCONNECT` (would force
-  autoconnect on our output, stream.c `pw_stream_connect`).
+  Env scrubbed (`aec_env`, fix round 8): every `PIPEWIRE_*` variable
+  except `PIPEWIRE_REMOTE` / `PIPEWIRE_RUNTIME_DIR` is dropped --
+  `PIPEWIRE_CONFIG_*` (another config), `PIPEWIRE_AUTOCONNECT` (forced
+  autoconnect, stream.c `pw_stream_connect`), and `PIPEWIRE_PROPS` /
+  `PIPEWIRE_NODE` / ... which stream.c applies AFTER the configured
+  stream props (an inherited `media.class` would unhide our output).
 - Nodes (per-session names, `aec_names`): `meet-recorder.aec-capture.<id>`
-  (capture, `target.object` = the SAME real mic node the raw recorder
-  pins, `node.passive = false`), `meet-recorder.aec-reference.<id>`
+  (capture, `target.object` = the call's mic at start (`aec_mic` in
+  session.json), `node.passive = false`), `meet-recorder.aec-reference.<id>`
   (monitor.mode: capture of the default sink's monitor, untargeted = same
   rule as the speaker recorder), `meet-recorder.aec-mic.<id>` (output).
 - Smallest blast radius: nothing is loaded into the daemon or WirePlumber,
@@ -193,46 +196,68 @@ re-links on a default change) both to the default sink. Teams on a
 non-default sink -> raw mic (on headphones there is no echo anyway). A
 pinned MIC is fine: the canceller captures that same mic by name.
 
-### Requirement 4: fallback safety
+### Requirement 4: AEC is strictly additive (fix round 8, Codex round 7)
 
-- Raw backup always from the real mic node explicitly: `pw-record
-  --target <mic>` where mic = the call's mic (pin_mic or the default
-  source), checked by `is_real_mic` (not a monitor, not an echo
-  canceller, not ours). If that mic disappears WirePlumber falls back to
-  the default source, which can never be our node (above).
-- Start order: helper -> output node seen -> AEC recorder -> link seen ->
-  THEN speaker + raw recorders (origin). A complete AEC track is therefore
-  exactly `aec_lead` (session.json, origin - link time) longer than raw.
-  Any AEC failure before that -> helper/recorder stopped, partial WAV
-  deleted, the session is exactly the old 2-recorder one (raw follows the
-  default as before). Costs at most ~7 s of start latency, only on failure.
-- Choice (`pick_mic_track`, pure, over `wav_profile` = duration + 1 s
-  window peaks): AEC only if (a) both WAVs are readable 16-bit; (b) no
-  gap: AEC >= raw + aec_lead - 0.5 s and its head start <= 15 s; (c) no
-  sustained silence: no 10 consecutive AEC windows of digital silence
-  (peak <= 2) during which raw has signal (peak > 100) in >= 5 of them
-  (`silent_stretch`; a recording < 10 s is judged whole: AEC silent
-  throughout while raw has signal in half). Both quiet = nobody spoke,
-  fine. Suppressed echo (far side only) is quiet, not digital zero, so it
-  does not trigger. The AEC track is trimmed by its head start
-  (`ffmpeg -ss`) so it lines up with sys.wav.
-- WAVs are kept until outputs are encoded; with AEC, meeting.m4a and
-  me.m4a must also verify (ffprobe duration >= 95 % - 1 s of the input),
-  else everything is encoded again from the raw mic (`encode_session`).
-  meta.json: `mic_echo_cancel`, `mic_track_reason`.
+- The raw mic recorder is exactly the pre-AEC one (`plan_mic` target =
+  pin_mic or the default; it follows a default-mic switch like Teams
+  does) and writes `mic.wav`. AEC is an extra track, `mic-aec.wav`.
+- Start order (`start_locked`): speaker + raw recorders FIRST (origin),
+  0.4 s check, THEN the canceller (`start_aec`) with one total budget
+  `AEC_BUDGET` = 3 s for node + link; every pw-dump is bounded by the time
+  left (`wait_aec_graph(deadline=...)`, `run_json(timeout=)`). Failure =
+  helper/recorder stopped (1 s each), WAV deleted, `mic_note` says why;
+  the primaries never notice. `aec_delay` (session.json) = link time -
+  origin: a complete AEC track is raw - aec_delay long.
+- Primary failures never discard usable tracks: whichever of speaker /
+  raw mic came up is recorded (`start_note`, notified); AEC is skipped
+  without the raw mic. Neither up -> `StartFailed` -> RETRY (76), so the
+  watcher retries (bounded) instead of marking the call handled; manual
+  starts are notified at once.
+- Route divergence (`aec_route_error`, pure): module-echo-cancel sets
+  `node.link-group`, so WirePlumber never moves its capture with the
+  default (Codex). AEC is invalid once the call's mic != `aec_mic` or the
+  call app plays to a non-default sink (the reference follows the
+  default). With no call stream, the mic is compared with the default
+  only if `aec_mic` was the default at start (`aec_follows_default`).
+  Checked by the watcher every `AEC_ROUTE_SECONDS` (10 s; first hit
+  recorded as `aec_diverged` in session.json under the lock,
+  `mark_aec_diverged`) and once more at stop (`probe_aec_route`, pactl
+  bounded to 2 s each). Unreadable defaults count as divergence.
+- Choice (`mic_choice` -> `pick_mic_track`, pure, over `wav_profile` =
+  duration + 1 s peaks + 1 s RMS via `math.sumprod`): AEC only if (a) not
+  diverged; (b) both readable 16-bit; (c) lengths agree: raw - AEC within
+  0.5 s of `aec_delay` both ways, delay <= `AEC_MAX_DELAY` (5 s); (d)
+  `aec_voice_error` finds no lost voice: AEC wholly near-silent (RMS < 30)
+  while raw has speech (1 s RMS >= 250) anywhere -> raw; otherwise per
+  10 s window, the seconds where raw is at speech level AND sys.wav is
+  quiet (RMS < 100: those are the user's own voice; with the far side
+  talking, raw may be echo that AEC rightly removes) -- AEC over them
+  near-silent (< 30 or 20 dB under raw) = lost; > 20 % of such windows
+  lost -> raw. The chosen AEC track is spliced behind the first offset
+  seconds of raw (`splice_mic` -> `mic-aec-aligned.wav`) so it lines up
+  with sys.wav. Fix-round-7 sessions (AEC in `mic_wav`, raw in
+  `mic_raw_wav`) use their raw track.
+- Verification (`encode_session`): meeting.m4a, me.m4a and others.m4a
+  must all decode at >= 95 % - 1 s of their input, on the AEC path AND
+  the raw path. AEC failing -> re-encode from raw. Raw failing ->
+  `Unverified`: every WAV is kept in the staging dir, meta.json gets
+  `audio_unverified` + `wavs_kept_in`, transcription still runs (the
+  collector keeps a dir with WAVs).
+- meta.json: `mic_echo_cancel`, `mic_track_reason` (AEC sessions) or
+  `mic_note`, `start_note`.
 
 ### Requirement 5
 
-`[audio] mic_source` stays `auto`: 1-4 hold by construction, and every
-unverified live behaviour (passive reference, WirePlumber stream-to-stream
-link, webrtc output level) can only end in the raw mic, never in silence
-or in a change to Teams' audio. `raw` = no canceller process at all.
+`[audio] mic_source` defaults to `raw` (fix round 8): AEC is opt-in with
+`auto` until it has passed a real call. `raw` = no canceller process at
+all. Blank = raw.
 
 ### Still to verify live (silently, see the fix-round-7 commit)
 
 stream-to-stream link of our pw-record to the private node; the AEC track
 passing pick_mic_track on a real call; reference re-link on a default
-sink change mid-call.
+sink change mid-call; the voice-check thresholds (RAW_SPEECH_RMS etc.)
+against a real mic. Until then `mic_source = raw`.
 
 - Whisper: `[whisper] initial_prompt` (raw read, `%` ok; blank = none),
   `beam_size` (>= 1), `condition_on_previous_text` -> `whisper_options`,
@@ -317,12 +342,32 @@ sink change mid-call.
   `volatile_ticks` (2) of the last `volatile_window` (5) ticks and stays so
   until it has not moved for 5 ticks (hysteresis, so low-motion video does
   not flicker in and out). Volatile cells are ignored: *settled* = no calm
-  cell moved for `settle_ticks` (2) ticks; *new* = ≥ `change_fraction` (3 %)
-  of calm cells differ from the last KEPT thumbnail by >
-  `cell_change_threshold` (0.02), or their mean diff ≥ `change_threshold`
-  (0.005). > `max_volatile` (85 %) volatile (full-window video, gallery) →
-  nothing kept. Then `min_gap_seconds` / `max_frames`. A failed sample, a
-  missing window or a different stableId resets the history (no stale diff).
+  cell moved for `settle_ticks` (2) ticks; *new* = `region_is_new` (fix
+  round 8, below). > `max_volatile` (85 %) volatile (full-window video,
+  gallery) → nothing kept. Then `min_gap_seconds` / `max_frames`. A failed
+  sample, a missing window or a different stableId resets the history (no
+  stale diff).
+- **Large coherent region** (fix round 8; why: two real calls kept 39
+  frames / 29 min and 55 / 46 min, almost all Teams gallery views --
+  speaking rings, tile reflow, name labels). *new* = the calm cells that
+  differ from the last kept thumbnail by > `cell_change_threshold` (0.02)
+  contain ONE region of >= `region_fraction` (25 %) of ALL cells
+  (`largest_region`: cells within Chebyshev distance 2 are connected,
+  `SCREEN_REGION_REACH`, so a slide's text lines with blank rows between
+  them are one block; strict 8-connectivity gave the synthetic text deck
+  34-45 cells, right at the 36-cell line). Operator's numbers
+  (`.work/frame-stats.txt`, consecutive kept frames): gallery churn changed
+  <= 20 % of cells, largest connected <= 18 %; shares/slide changes mostly
+  one block of 25-95 %. Proxy on today's kept frames: call 1 39 -> 7
+  (lower bound 7, upper 8 if every changed cell joined), call 2 55 -> 28
+  (28-31). A single new text line or caret is now NOT a new frame; a
+  first frame is still kept at the start (nothing to compare with).
+  Real-number test: `test_real_call_numbers` (layout model: largest region
+  as one block, the rest as separate clumps).
+- **min_width** (fix round 8): no capture while the window is narrower
+  than `min_width` (900 logical px; call 1's Teams window was 338-598 px
+  wide, so its share was unreadable) -- logged once per worker. Call 1
+  would have produced 0 frames.
   Why 2 (not the 3 first tried): live, a random strip cell sometimes holds
   still for one tick; 3-of-5 then took ~15 s to warm up and missed a first
   slide shown for 15 s (measured).
